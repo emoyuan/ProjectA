@@ -224,31 +224,89 @@ export class HoldBase extends Component {
         return null;
     }
 
-    public getClosestPointOnVolumeLine(shoulderPos: Vec2): Vec2 | null {
+    public getClosestPointOnVolumeLine(worldTarget: Vec2): Vec2 | null {
         if (this.type !== HoldType.VOLUME) return null;
+        const segment = this.getVolumeLineSegment();
+        if (!segment) return null;
+        return this.closestPointOnSegment(worldTarget, segment.start, segment.end);
+    }
+
+    public getReachablePointOnVolumeLine(root: Vec2, desiredTarget: Vec2, maxDist: number): Vec2 | null {
+        const segment = this.getVolumeLineSegment();
+        if (!segment) return null;
+
+        const desiredOnLine = this.closestPointOnSegment(desiredTarget, segment.start, segment.end);
+        const currentDist = Vec2.distance(root, desiredOnLine);
+        if (currentDist <= maxDist) return desiredOnLine;
+
+        const rootToStart = new Vec2(segment.start.x - root.x, segment.start.y - root.y);
+        const rootToEnd = new Vec2(segment.end.x - root.x, segment.end.y - root.y);
+        const startDist = rootToStart.length();
+        const endDist = rootToEnd.length();
+
+        const lineDir = new Vec2(segment.end.x - segment.start.x, segment.end.y - segment.start.y);
+        const lineLen = lineDir.length();
+        if (lineLen < 0.001) {
+            return startDist < endDist ? segment.start.clone() : segment.end.clone();
+        }
+        lineDir.normalize();
+
+        const relRoot = new Vec2(root.x - segment.start.x, root.y - segment.start.y);
+        let proj = relRoot.x * lineDir.x + relRoot.y * lineDir.y;
+        proj = Math.max(0, Math.min(lineLen, proj));
+        const closestOnLine = new Vec2(segment.start.x + lineDir.x * proj, segment.start.y + lineDir.y * proj);
+        const perpDist = Vec2.distance(root, closestOnLine);
+
+        if (perpDist >= maxDist) {
+            return startDist < endDist ? segment.start.clone() : segment.end.clone();
+        }
+
+        const dt = Math.sqrt(maxDist * maxDist - perpDist * perpDist);
+        const candidates: Vec2[] = [];
+        const t1 = proj - dt;
+        const t2 = proj + dt;
+        if (t1 >= 0 && t1 <= lineLen) {
+            candidates.push(new Vec2(segment.start.x + lineDir.x * t1, segment.start.y + lineDir.y * t1));
+        }
+        if (t2 >= 0 && t2 <= lineLen) {
+            candidates.push(new Vec2(segment.start.x + lineDir.x * t2, segment.start.y + lineDir.y * t2));
+        }
+
+        if (candidates.length === 0) {
+            return startDist < endDist ? segment.start.clone() : segment.end.clone();
+        }
+
+        let best = candidates[0];
+        let bestDist = Vec2.distance(best, desiredOnLine);
+        for (let i = 1; i < candidates.length; i++) {
+            const d = Vec2.distance(candidates[i], desiredOnLine);
+            if (d < bestDist) {
+                best = candidates[i];
+                bestDist = d;
+            }
+        }
+        return best;
+    }
+
+    private getVolumeLineSegment(): { start: Vec2; end: Vec2 } | null {
         const uiTransform = this.node.getComponent(UITransform);
         if (!uiTransform) return null;
         const pos = this.node.position;
         const angle = this.node.angle * Math.PI / 180;
         const scale = this.node.scale;
-        const cos = Math.cos(angle), sin = Math.sin(angle);
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
         const w = uiTransform.width * scale.x;
-        const ax = uiTransform.anchorX, ay = uiTransform.anchorY;
-        const offsetX = (0.5 - ax) * w, offsetY = (0.5 - ay) * (uiTransform.height * scale.y);
+        const ax = uiTransform.anchorX;
+        const ay = uiTransform.anchorY;
+        const offsetX = (0.5 - ax) * w;
+        const offsetY = (0.5 - ay) * (uiTransform.height * scale.y);
         const centerX = pos.x + cos * offsetX - sin * offsetY;
         const centerY = pos.y + sin * offsetX + cos * offsetY;
         const halfW = w / 2 + this.volumeMargin;
-        const lineStartX = centerX + cos * (-halfW);
-        const lineStartY = centerY + sin * (-halfW);
-        const lineEndX = centerX + cos * halfW;
-        const lineEndY = centerY + sin * halfW;
-        return this.closestPointOnSegment(shoulderPos, new Vec2(lineStartX, lineStartY), new Vec2(lineEndX, lineEndY));
-    }
-
-    public getReachableGrip(shoulderPos: Vec2, maxArmLen: number): Vec2 {
-        if (this.type !== HoldType.VOLUME) return this.localPos.clone();
-        const closest = this.getClosestPointOnVolumeLine(shoulderPos);
-        return closest ? closest.clone() : this.localPos.clone();
+        const start = new Vec2(centerX + cos * (-halfW), centerY + sin * (-halfW));
+        const end = new Vec2(centerX + cos * halfW, centerY + sin * halfW);
+        return { start, end };
     }
 
     public getWorldForceDirection(): Vec2 {

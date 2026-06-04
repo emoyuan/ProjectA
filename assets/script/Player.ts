@@ -228,6 +228,14 @@ export class Player extends Component {
     private dragOffset: Vec2 = new Vec2(0, 0);
     private initialHipY: number = -70;
 
+    @property({ tooltip: '躯干左右侧倾的最大偏移量（像素）' })
+    maxTorsoLean: number = 40;
+
+    @property({ tooltip: '手脚超出可达时躯干辅助移动的比例' })
+    torsoAssistFactor: number = 0.5;
+
+    private torsoLean: number = 0;
+
     private lastAdsorbTime: number = 0;   // 最近一次吸附的时间戳（毫秒）
     // 失衡计时器（毫秒）
     private imbalanceTimer: number = 0;
@@ -347,12 +355,48 @@ export class Player extends Component {
 
     initPose() {
         const s = this.scaleFactor;
+        this.torsoLean = 0;
         this.shoulder.set(0, 70 * s);
         this.hip.set(0, -70 * s);
         this.head.set(0, 155 * s);
-        const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2 * s;
-        this.leftShoulder.set(-shoulderHalfW, this.shoulder.y);
-        this.rightShoulder.set(shoulderHalfW, this.shoulder.y);
+        this.updateShoulderPositions();
+    }
+
+    private updateShoulderPositions() {
+        const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2 * this.scaleFactor;
+        this.shoulder.x = this.hip.x + this.torsoLean;
+        this.leftShoulder.set(this.shoulder.x - shoulderHalfW, this.shoulder.y);
+        this.rightShoulder.set(this.shoulder.x + shoulderHalfW, this.shoulder.y);
+        this.head.x = this.shoulder.x;
+        if (this.leftArm) this.leftArm.root.set(this.leftShoulder);
+        if (this.rightArm) this.rightArm.root.set(this.rightShoulder);
+    }
+
+    private clampTorsoLean(value: number): number {
+        return Math.max(-this.maxTorsoLean, Math.min(this.maxTorsoLean, value));
+    }
+
+    private tryAdjustTorsoForReach(chain: BoneChain, desiredX: number, desiredY: number): boolean {
+        const root = chain.root;
+        const dx = desiredX - root.x;
+        const dy = desiredY - root.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const maxDist = chain.upperLen + chain.lowerLen;
+        if (dist <= maxDist + 1e-3) return false;
+
+        if (chain.isArm) {
+            const leanDelta = dx / dist * dist * this.torsoAssistFactor * 0.3;
+            const oldLean = this.torsoLean;
+            this.torsoLean = this.clampTorsoLean(this.torsoLean + leanDelta);
+            this.updateShoulderPositions();
+            const newDist = Vec2.distance(chain.root, new Vec2(desiredX, desiredY));
+            return newDist <= maxDist + 1e-3 && Math.abs(this.torsoLean - oldLean) > 0.5;
+        }
+
+        const shiftX = dx / dist * Math.min(dist * this.torsoAssistFactor * 0.25, this.maxTorsoLean * 0.5);
+        this.moveBodyByDelta(shiftX, 0);
+        const newDist = Vec2.distance(chain.root, new Vec2(desiredX, desiredY));
+        return newDist <= maxDist + 1e-3;
     }
 
     resetToInitialPose() {
@@ -612,54 +656,36 @@ export class Player extends Component {
 
                     if (hold.type === HoldType.VOLUME) {
                         const newTarget = new Vec2(chain.target.x + dx, chain.target.y + dy);
-                        const adsorbPos = hold.getAdsorbedPosition(newTarget);
-                        const inDelay = (Date.now() - this.lastAdsorbTime) < (this.dragHoldDelay * 1000);
 
                         // 若为脚部，需要额外检查约束，不满足则阻止移动
                         if (this.activePart === 'leftFoot' || this.activePart === 'rightFoot') {
-                            if (!adsorbPos) {
-                                // 离开矩形区域，若超延迟可脱离，否则阻止
-                                if (!inDelay) {
-                                    this.adsorbedHold.delete(this.activePart);
-                                    this.holdManager.startCooldown(hold);
-                                    this.dragOffset.set(0, 0);
-                                    chain.target.set(newTarget);
-                                    this.constrainTargetToReach(chain);
-                                    this.solveAllChains();
-                                    return true;
-                                }
-                                return false; // 延迟内不脱离，但也不移动
+                            const volumeTarget = hold.getReachablePointOnVolumeLine(chain.root, newTarget, chain.upperLen + chain.lowerLen);
+                            if (!volumeTarget) {
+                                this.solveAllChains();
+                                return true;
                             }
 
-                            // 模拟设置目标，检查约束
                             const origTarget = chain.target.clone();
-                            chain.target.set(adsorbPos);
-                            // 1. 髋部连线距离检查
+                            chain.target.set(volumeTarget);
                             const signedDist = getSignedDist(this.hip.x, this.hip.y);
-                            // 2. 脚高度约束
-                            const footOk = (adsorbPos.y + this.footHipOffset < this.hip.y);
-                            chain.target.set(origTarget); // 恢复
+                            const footOk = (volumeTarget.y + this.footHipOffset < this.hip.y);
+                            chain.target.set(origTarget);
 
                             if (signedDist < this.minHipToFeetLineDist || !footOk) {
-                                return false; // 违反约束，禁止移动
+                                return false;
                             }
 
-                            // 约束通过，应用新位置
-                            chain.target.set(adsorbPos);
+                            chain.target.set(volumeTarget);
                             this.solveAllChains();
                             return true;
                         } else {
                             // 手部 Volume 滑动（无额外约束）
-                            if (adsorbPos) {
-                                chain.target.set(adsorbPos);
-                            } else {
-                                if (!inDelay) {
-                                    this.adsorbedHold.delete(this.activePart);
-                                    this.holdManager.startCooldown(hold);
-                                    this.dragOffset.set(0, 0);
-                                    chain.target.set(newTarget);
-                                    this.constrainTargetToReach(chain);
-                                }
+                            if (chain.isArm) {
+                                this.tryAdjustTorsoForReach(chain, newTarget.x, newTarget.y);
+                            }
+                            const volumeTarget = hold.getReachablePointOnVolumeLine(chain.root, newTarget, chain.upperLen + chain.lowerLen);
+                            if (volumeTarget) {
+                                chain.target.set(volumeTarget);
                             }
                             this.solveAllChains();
                             return true;
@@ -734,17 +760,19 @@ export class Player extends Component {
                 const maxDist = chain.upperLen + chain.lowerLen;
 
                 if (dist > maxDist) {
-                    if (this.followBodyWithArm && chain.isArm) {
-                        const dirX = ndx / dist;
-                        const dirY = ndy / dist;
-                        chain.target.set(root.x + dirX * maxDist, root.y + dirY * maxDist);
-                        const remainDx = newTargetX - chain.target.x;
-                        const remainDy = newTargetY - chain.target.y;
-                        const bodyDx = remainDx / 0.6;
-                        const bodyDy = remainDy;
-                        this.moveBodyByDelta(bodyDx, bodyDy);
-                    } else {
-                        chain.target.set(root.x + (ndx / dist) * maxDist, root.y + (ndy / dist) * maxDist);
+                    if (!this.tryAdjustTorsoForReach(chain, newTargetX, newTargetY)) {
+                        if (this.followBodyWithArm && chain.isArm) {
+                            const dirX = ndx / dist;
+                            const dirY = ndy / dist;
+                            chain.target.set(root.x + dirX * maxDist, root.y + dirY * maxDist);
+                            const remainDx = newTargetX - chain.target.x;
+                            const remainDy = newTargetY - chain.target.y;
+                            const bodyDx = remainDx / 0.6;
+                            const bodyDy = remainDy;
+                            this.moveBodyByDelta(bodyDx, bodyDy);
+                        } else {
+                            chain.target.set(root.x + (ndx / dist) * maxDist, root.y + (ndy / dist) * maxDist);
+                        }
                     }
                 }
                 this.constrainTargetToReach(chain);
@@ -847,9 +875,8 @@ export class Player extends Component {
                     const chain = this.getChainByPart(part);
                     if (!chain) continue;
                     if (hold.type === HoldType.VOLUME && (part === 'leftHand' || part === 'rightHand')) {
-                        const closestOnLine = hold.getClosestPointOnVolumeLine(chain.root);
-                        if (closestOnLine) chain.target.set(closestOnLine);
-                        else chain.target.set(hold.localPos);
+                        const lineTarget = hold.getClosestPointOnVolumeLine(chain.target) ?? chain.target.clone();
+                        chain.target.set(lineTarget);
                     } else if (part === 'leftFoot' || part === 'rightFoot') {
                         // 脚固定
                     } else {
@@ -879,6 +906,24 @@ export class Player extends Component {
                 root.x + (dx / dist) * maxDist,
                 root.y + (dy / dist) * maxDist
             );
+        }
+    }
+
+    private updateVolumeLockedArmTargets() {
+        for (const part of ['leftHand', 'rightHand'] as const) {
+            const hold = this.adsorbedHold.get(part);
+            if (!hold || hold.type !== HoldType.VOLUME) continue;
+            const chain = this.getChainByPart(part);
+            if (!chain) continue;
+            const desiredTarget = hold.getClosestPointOnVolumeLine(chain.target) ?? chain.target.clone();
+            const reachablePoint = hold.getReachablePointOnVolumeLine(chain.root, desiredTarget, chain.upperLen + chain.lowerLen);
+            if (reachablePoint) {
+                chain.target.set(reachablePoint);
+            } else if (desiredTarget) {
+                chain.target.set(desiredTarget);
+            } else {
+                chain.target.set(hold.localPos);
+            }
         }
     }
 
@@ -949,9 +994,8 @@ export class Player extends Component {
             const chain = this.getChainByPart(part);
             if (!chain) continue;
             if (hold.type === HoldType.VOLUME && (part === 'leftHand' || part === 'rightHand')) {
-                const closestOnLine = hold.getClosestPointOnVolumeLine(chain.root);
-                if (closestOnLine) chain.target.set(closestOnLine);
-                else chain.target.set(hold.localPos);
+                const lineTarget = hold.getClosestPointOnVolumeLine(chain.target) ?? chain.target.clone();
+                chain.target.set(lineTarget);
             } else if (part === 'leftFoot' || part === 'rightFoot') {
                 // 脚固定
             } else {
@@ -1193,15 +1237,26 @@ export class Player extends Component {
         for (let iter = 0; iter < 2; iter++) {
             for (const { arm, shoulderDx, part } of adsorbedArms) {
                 const hold = this.adsorbedHold.get(part)!;
-                const shoulderPos = new Vec2(hipX + shoulderDx, hipY + shoulderOffsetY);
+                const shoulderPos = new Vec2(hipX + this.torsoLean + shoulderDx, hipY + shoulderOffsetY);
                 const maxLen = arm.upperLen + arm.lowerLen;
 
                 let targetX: number, targetY: number;
                 if (hold.type === HoldType.VOLUME) {
-                    const closestOnLine = hold.getClosestPointOnVolumeLine(shoulderPos);
-                    if (!closestOnLine) continue;
-                    targetX = closestOnLine.x - shoulderDx;
-                    targetY = closestOnLine.y - shoulderOffsetY;
+                    const desiredTarget = hold.getClosestPointOnVolumeLine(arm.target) ?? arm.target.clone();
+                    const currentDist = Vec2.distance(shoulderPos, desiredTarget);
+                    let linePoint = desiredTarget;
+                    if (currentDist > maxLen) {
+                        const reachable = hold.getReachablePointOnVolumeLine(shoulderPos, desiredTarget, maxLen);
+                        if (reachable) {
+                            linePoint = reachable;
+                        } else {
+                            const closestOnLine = hold.getClosestPointOnVolumeLine(shoulderPos);
+                            if (!closestOnLine) continue;
+                            linePoint = closestOnLine;
+                        }
+                    }
+                    targetX = linePoint.x - shoulderDx;
+                    targetY = linePoint.y - shoulderOffsetY;
                 } else {
                     targetX = arm.target.x - shoulderDx;
                     targetY = arm.target.y - shoulderOffsetY;
@@ -1221,16 +1276,57 @@ export class Player extends Component {
 
     private moveBodyRoots(deltaX: number, deltaY: number) {
         this.hip.x += deltaX; this.hip.y += deltaY;
-        this.shoulder.x += deltaX; this.shoulder.y += deltaY;
+        this.shoulder.y += deltaY;
         this.head.x += deltaX; this.head.y += deltaY;
-        const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2;
-        this.leftShoulder.set(this.shoulder.x - shoulderHalfW, this.shoulder.y);
-        this.rightShoulder.set(this.shoulder.x + shoulderHalfW, this.shoulder.y);
-        this.leftArm.root.set(this.leftShoulder);
-        this.rightArm.root.set(this.rightShoulder);
+        this.updateShoulderPositions();
         const hipHalfW = this.appearance.torsoWidth * 0.35;
         this.leftLeg.root.set(this.hip.x - hipHalfW, this.hip.y);
         this.rightLeg.root.set(this.hip.x + hipHalfW, this.hip.y);
+    }
+
+    public resetTorsoLeanIfPossible() {
+        if (this.torsoLean === 0) return;
+        const previousLean = this.torsoLean;
+        const safeLean = 0;
+
+        const oldLeftRoot = this.leftArm.root.clone();
+        const oldRightRoot = this.rightArm.root.clone();
+        const oldShoulderX = this.shoulder.x;
+
+        this.torsoLean = safeLean;
+        this.updateShoulderPositions();
+
+        const leftCanReach = this.canRootReachCurrentTarget(this.leftArm, 'leftHand');
+        const rightCanReach = this.canRootReachCurrentTarget(this.rightArm, 'rightHand');
+        if (!leftCanReach || !rightCanReach) {
+            this.torsoLean = previousLean;
+            this.shoulder.x = oldShoulderX;
+            this.leftArm.root.set(oldLeftRoot);
+            this.rightArm.root.set(oldRightRoot);
+            this.updateShoulderPositions();
+            return;
+        }
+
+        // 更新目标与骨链以反映术直躯干状态
+        this.solveAllChains();
+    }
+
+    private canRootReachCurrentTarget(chain: BoneChain, part: BodyPart): boolean {
+        if (!chain || !chain.isArm) return true;
+        const hold = this.adsorbedHold.get(part);
+        if (!hold) return true;
+
+        const maxLen = chain.upperLen + chain.lowerLen;
+        const target = chain.target.clone();
+        const dist = Vec2.distance(chain.root, target);
+        if (dist <= maxLen + 1e-3) return true;
+
+        if (hold.type === HoldType.VOLUME) {
+            const reachable = hold.getReachablePointOnVolumeLine(chain.root, target, maxLen);
+            return reachable !== null && Vec2.distance(chain.root, reachable) <= maxLen + 1e-3;
+        }
+
+        return false;
     }
 
     public releaseHoldAndCooldown(part: BodyPart) {
@@ -1320,8 +1416,13 @@ export class Player extends Component {
 
         // 躯干
         gfx.fillColor = app.clothColor;
-        const torsoHalfW = torsoW / 2;
-        gfx.roundRect(this.shoulder.x - torsoHalfW, this.hip.y - 5 * s, torsoW, torsoH + 10 * s, 15 * s);
+        const leftHip = new Vec2(this.hip.x - app.torsoWidth * 0.35 * s, this.hip.y);
+        const rightHip = new Vec2(this.hip.x + app.torsoWidth * 0.35 * s, this.hip.y);
+        gfx.moveTo(this.leftShoulder.x, this.leftShoulder.y + 5 * s);
+        gfx.lineTo(this.rightShoulder.x, this.rightShoulder.y + 5 * s);
+        gfx.lineTo(rightHip.x, rightHip.y - 5 * s);
+        gfx.lineTo(leftHip.x, leftHip.y - 5 * s);
+        gfx.close();
         gfx.fill();
 
         // 头
@@ -1342,8 +1443,6 @@ export class Player extends Component {
         gfx.fillColor = app.clothColor;
         gfx.circle(this.leftShoulder.x, this.leftShoulder.y, 8 * s); gfx.fill();
         gfx.circle(this.rightShoulder.x, this.rightShoulder.y, 8 * s); gfx.fill();
-        const leftHip = new Vec2(this.hip.x - app.torsoWidth * 0.35 * s, this.hip.y);
-        const rightHip = new Vec2(this.hip.x + app.torsoWidth * 0.35 * s, this.hip.y);
         gfx.circle(leftHip.x, leftHip.y, 7 * s); gfx.fill();
         gfx.circle(rightHip.x, rightHip.y, 7 * s); gfx.fill();
 

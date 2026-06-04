@@ -79,11 +79,14 @@ export class UIController extends Component {
             return;
         }
 
-        // 重置
+        // 重置/特殊操作
         switch (event.keyCode) {
             case KeyCode.KEY_R:
                 this.resetUI();
-                break;
+                return;
+            case KeyCode.KEY_W:
+                this.player.resetTorsoLeanIfPossible();
+                return;
         }
 
         // 部件选择
@@ -118,10 +121,10 @@ export class UIController extends Component {
 
     private getIndexByKeyCode(keyCode: KeyCode): number {
         switch (keyCode) {
-            case KeyCode.KEY_A: return 0;  // 左手
-            case KeyCode.KEY_D: return 1;  // 右手
-            case KeyCode.KEY_Z: return 2;  // 左脚
-            case KeyCode.KEY_C: return 3;  // 右脚
+            case KeyCode.KEY_Q: return 0;  // 左手
+            case KeyCode.KEY_E: return 1;  // 右手
+            case KeyCode.KEY_A: return 2;  // 左脚
+            case KeyCode.KEY_D: return 3;  // 右脚
             case KeyCode.KEY_S: return 4;  // 躯干
             default: return -1;
         }

@@ -2728,6 +2728,8 @@
     "forceAngleToleranceTime": 2,
     "balanceToleranceTime": 2,
     "groundStandTolerance": 10,
+    "maxTorsoLean": 40,
+    "torsoAssistFactor": 0.5,
     "_id": "3dO6xcYe9HXpvOm5vcspJq"
   },
   {
