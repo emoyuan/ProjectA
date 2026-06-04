@@ -1,0 +1,118 @@
+// Copyright (c) 2023, Cocos Creator. All rights reserved.
+CCEffect %{
+  techniques:
+  - name: opaque
+    passes:
+    - vert: vs_main
+      frag: fs_main
+      blendState:
+        targets:
+        - blend: true
+          blendSrc: src_alpha
+          blendDst: one_minus_src_alpha
+          blendSrcAlpha: src_alpha
+          blendDstAlpha: one_minus_src_alpha
+      rasterizerState:
+        cullMode: none
+      properties:
+        u_color: { value: [1.0, 1.0, 1.0, 1.0], editor: { type: color } }
+        u_alphaStrength: { value: 0.6, editor: { range: [0.0, 1.0], slide: true } }
+        u_upperRange:   { value: 90.0, editor: { range: [0.0, 180.0], slide: true } }
+        u_lowerRange:   { value: 90.0, editor: { range: [0.0, 180.0], slide: true } }
+        mainTexture:    { value: white, editor: { type: texture } }
+        u_radius:       { value: 0.5, editor: { range: [0.0, 0.5], slide: true } }
+        u_enableOverlay: { value: 1.0, editor: { type: boolean } }
+}%
+
+CCProgram vs_main %{
+  precision highp float;
+  #include <builtin/uniforms/cc-global>
+  #include <builtin/uniforms/cc-local>
+
+  in vec3 a_position;
+  in vec2 a_texCoord;
+  out vec2 v_uv;
+
+  void main() {
+    vec4 pos = cc_matProj * cc_matView * cc_matWorld * vec4(a_position, 1.0);
+    gl_Position = pos;
+    v_uv = a_texCoord;
+  }
+}%
+
+CCProgram fs_main %{
+  precision highp float;
+  #include <builtin/uniforms/cc-global>
+
+  in vec2 v_uv;
+  uniform Constant {
+    vec4 u_color;
+    float u_alphaStrength;
+    float u_upperRange;
+    float u_lowerRange;
+    float u_radius;
+    float u_enableOverlay;
+  };
+  uniform sampler2D mainTexture;
+
+  layout(location = 0) out vec4 fragColor;
+
+  void main() {
+    // 采样原始贴图（底图）
+    vec4 texColor = texture(mainTexture, v_uv);
+    // 默认最终颜色为底图
+    vec4 finalColor = texColor;
+    
+    // 如果半透明叠加层开关关闭，直接输出底图
+    if (u_enableOverlay > 0.5) {
+      // 圆形叠加层的圆心和半径（UV空间，圆心0.5,0.5，半径可调）
+      vec2 center = vec2(0.5, 0.5);
+      vec2 offset = v_uv - center;
+      float dist = length(offset);
+      
+      float overlayAlpha = 0.0;
+      
+      // 只处理圆形内部区域（dist <= u_radius）
+      if (dist <= u_radius) {
+        // 计算与垂直向上方向的夹角，实现对称扇形渐变
+        vec2 dir = normalize(offset);
+        vec2 up = vec2(0.0, -1.0);
+        float dotUp = dot(dir, up);
+        float angleFromUp = degrees(acos(dotUp));   // 0~180，0°向上，180°向下
+        
+        float maxAlpha = u_alphaStrength;
+        
+        // 上半圆 (angleFromUp <= 90°)
+        if (angleFromUp <= 90.0) {
+          float dev = angleFromUp;                    // 偏离向上方向的角度 0~90
+          float halfRange = u_upperRange * 0.5;       // 半角
+          if (u_upperRange > 0.0 && dev <= halfRange) {
+            float t = dev / halfRange;
+            overlayAlpha = t * maxAlpha;
+          }
+        }
+        // 下半圆 (angleFromUp > 90°)
+        else {
+          float dev = 180.0 - angleFromUp;            // 偏离向下方向的角度 0~90
+          float halfRange = u_lowerRange * 0.5;
+          if (u_lowerRange > 0.0 && dev <= halfRange) {
+            float t = dev / halfRange;
+            overlayAlpha = t * maxAlpha;
+          }
+        }
+        
+        // 半径边缘抗锯齿平滑（可选）
+        float smoothness = 0.02;
+        float edgeFactor = 1.0 - smoothstep(u_radius - smoothness, u_radius, dist);
+        overlayAlpha *= edgeFactor;
+      }
+      
+      // 叠加颜色：使用 u_color 的 RGB 和计算出的 overlayAlpha
+      vec4 overlayColor = vec4(u_color.rgb, overlayAlpha);
+      // 混合：底图 + 叠加层（简单alpha混合）
+      finalColor = texColor * (1.0 - overlayAlpha) + overlayColor * overlayAlpha;
+    }
+    
+    fragColor = finalColor;
+  }
+}%
