@@ -265,7 +265,7 @@ export class HoldBase extends Component {
         return best;
     }
 
-    private getVolumeLineSegment(): { start: Vec2; end: Vec2 } | null {
+    public getVolumeLineSegment(): { start: Vec2; end: Vec2 } | null {
         const uiTransform = this.node.getComponent(UITransform);
         if (!uiTransform) return null;
         const pos = this.node.position;

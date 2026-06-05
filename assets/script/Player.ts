@@ -216,7 +216,7 @@ export class Player extends Component {
     rightLeg: BoneChain = null!;
 
     activePart: BodyPart = 'leftHand';
-    followBodyWithArm: boolean = false;
+    followBodyWithArm: boolean = true;
 
     upperArmLen: number = 98;
     forearmLen: number = 84;
@@ -376,6 +376,40 @@ export class Player extends Component {
         return Math.max(-this.maxTorsoLean, Math.min(this.maxTorsoLean, value));
     }
 
+    /**
+     * 检查改变 torsoLean 后，另一只锁定的手是否仍能到达其目标。
+     * 如果不能，则不允许本次躯干旋转。
+     */
+    private canOtherLockedArmReachAfterLean(newLean: number, requestingPart: BodyPart): boolean {
+        const otherPart: BodyPart = requestingPart === 'leftHand' ? 'rightHand' : 'leftHand';
+        const otherHold = this.adsorbedHold.get(otherPart);
+        if (!otherHold) return true; // 另一只手没锁定，无限制
+
+        const otherChain = this.getChainByPart(otherPart);
+        if (!otherChain) return true;
+
+        // 保存当前状态
+        const oldLean = this.torsoLean;
+        const oldLeftRoot = this.leftArm.root.clone();
+        const oldRightRoot = this.rightArm.root.clone();
+        const oldShoulderX = this.shoulder.x;
+
+        // 临时应用新的 torsoLean
+        this.torsoLean = newLean;
+        this.updateShoulderPositions();
+
+        const canReach = this.canRootReachCurrentTarget(otherChain, otherPart);
+
+        // 恢复原状态
+        this.torsoLean = oldLean;
+        this.shoulder.x = oldShoulderX;
+        this.leftArm.root.set(oldLeftRoot);
+        this.rightArm.root.set(oldRightRoot);
+        this.updateShoulderPositions();
+
+        return canReach;
+    }
+
     private tryAdjustTorsoForReach(chain: BoneChain, desiredX: number, desiredY: number): boolean {
         const root = chain.root;
         const dx = desiredX - root.x;
@@ -387,7 +421,14 @@ export class Player extends Component {
         if (chain.isArm) {
             const leanDelta = dx / dist * dist * this.torsoAssistFactor * 0.3;
             const oldLean = this.torsoLean;
-            this.torsoLean = this.clampTorsoLean(this.torsoLean + leanDelta);
+            const newLean = this.clampTorsoLean(this.torsoLean + leanDelta);
+
+            // 检查另一只锁定的手是否能承受这次躯干旋转
+            if (!this.canOtherLockedArmReachAfterLean(newLean, this.activePart)) {
+                return false;
+            }
+
+            this.torsoLean = newLean;
             this.updateShoulderPositions();
             const newDist = Vec2.distance(chain.root, new Vec2(desiredX, desiredY));
             return newDist <= maxDist + 1e-3 && Math.abs(this.torsoLean - oldLean) > 0.5;
@@ -928,6 +969,77 @@ export class Player extends Component {
         }
     }
 
+    /**
+     * 检查身体移动 delta 后，所有锁定的肢体是否仍能到达其岩点目标。
+     * 如果任何锁定肢体无法到达，返回 false。
+     * 注意：此检查在 clampHipToAdsorbedLegs/clampHipToAdsorbedArms 之后执行，
+     * 那些函数已经确保了髋部在腿长/臂长范围内，此处做最终验证。
+     */
+    private canAllLockedLimbsReachAfterBodyMove(deltaX: number, deltaY: number): boolean {
+        // 计算移动后的髋部和肩部位置
+        const newHipX = this.hip.x + deltaX;
+        const newHipY = this.hip.y + deltaY;
+        const newShoulderY = this.shoulder.y + deltaY;
+        const newShoulderX = newHipX + this.torsoLean;
+        const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2 * this.scaleFactor;
+        const hipHalfW = this.appearance.torsoWidth * 0.35 * this.scaleFactor;
+
+        for (const [part, hold] of this.adsorbedHold) {
+            const chain = this.getChainByPart(part);
+            if (!chain) continue;
+
+            // 计算移动后该肢体的新 root
+            let newRoot: Vec2;
+            let hipDxForLeg: number = 0;
+            if (part === 'leftHand') {
+                newRoot = new Vec2(newShoulderX - shoulderHalfW, newShoulderY);
+            } else if (part === 'rightHand') {
+                newRoot = new Vec2(newShoulderX + shoulderHalfW, newShoulderY);
+            } else if (part === 'leftFoot') {
+                hipDxForLeg = -hipHalfW;
+                newRoot = new Vec2(newHipX + hipDxForLeg, newHipY);
+            } else if (part === 'rightFoot') {
+                hipDxForLeg = hipHalfW;
+                newRoot = new Vec2(newHipX + hipDxForLeg, newHipY);
+            } else {
+                continue;
+            }
+
+            const maxLen = chain.upperLen + chain.lowerLen;
+
+            if (hold.type === HoldType.VOLUME) {
+                // Volume：检查新 root 能否到达 Volume 线段上的任意点
+                const segment = hold.getVolumeLineSegment();
+                if (!segment) return false;
+                const distToStart = Vec2.distance(newRoot, segment.start);
+                const distToEnd = Vec2.distance(newRoot, segment.end);
+                if (Math.min(distToStart, distToEnd) > maxLen + 1e-3) {
+                    const closestOnLine = hold.getClosestPointOnVolumeLine(newRoot);
+                    if (!closestOnLine || Vec2.distance(newRoot, closestOnLine) > maxLen + 1e-3) {
+                        return false;
+                    }
+                }
+            } else {
+                // 点吸附：检查新 root 到岩点位置的距离
+                // 对于脚，使用与 clampHipToAdsorbedLegs 相同的 target 计算方式
+                let targetX: number, targetY: number;
+                if (part === 'leftFoot' || part === 'rightFoot') {
+                    targetX = chain.target.x;
+                    targetY = chain.target.y;
+                } else {
+                    const lockPos = hold.getAdsorbedPosition(chain.target) ?? hold.localPos;
+                    targetX = lockPos.x;
+                    targetY = lockPos.y;
+                }
+                const dist = Vec2.distance(newRoot, new Vec2(targetX, targetY));
+                if (dist > maxLen + 1e-3) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     private moveBodyByDelta(dx: number, dy: number, reduceTorsoLean: boolean = true) {
         let newX = this.hip.x + dx * 0.6;
         let newY = this.hip.y + dy;
@@ -952,7 +1064,9 @@ export class Player extends Component {
                 }
             } else {
                 const len = Math.sqrt(lenSq);
-                const signedDist = ((x - footA.x) * fdy - (y - footA.y) * fdx) / len;
+                // 法向量 nx = -fdy/len, ny = fdx/len（指向 footA→footB 的左侧）
+                // signedDist = (x-footA.x)*nx + (y-footA.y)*ny，正值表示髋部在连线左侧（上方）
+                const signedDist = (-(x - footA.x) * fdy + (y - footA.y) * fdx) / len;
                 if (signedDist < this.minHipToFeetLineDist) {
                     const nx = -fdy / len;
                     const ny = fdx / len;
@@ -976,6 +1090,11 @@ export class Player extends Component {
         const delta = new Vec2(valid.x - this.hip.x, valid.y - this.hip.y);
         if (delta.x === 0 && delta.y === 0) return;
 
+        // ★ 关键检查：身体移动后，所有锁定的肢体是否仍能到达岩点
+        if (!this.canAllLockedLimbsReachAfterBodyMove(delta.x, delta.y)) {
+            return;
+        }
+
         this.moveBodyRoots(delta.x, delta.y);
 
         const limbs: { chain: BoneChain; part: BodyPart }[] = [
@@ -996,9 +1115,17 @@ export class Player extends Component {
             if (!chain) continue;
             if (hold.type === HoldType.VOLUME && (part === 'leftHand' || part === 'rightHand')) {
                 const lineTarget = hold.getClosestPointOnVolumeLine(chain.target) ?? chain.target.clone();
-                chain.target.set(lineTarget);
+                const reachable = hold.getReachablePointOnVolumeLine(chain.root, lineTarget, chain.upperLen + chain.lowerLen);
+                if (reachable) {
+                    chain.target.set(reachable);
+                } else {
+                    chain.target.set(lineTarget);
+                }
             } else if (part === 'leftFoot' || part === 'rightFoot') {
-                // 脚固定
+                // 脚固定：重新锁定到岩点位置
+                const lockPos = hold.getAdsorbedPosition(chain.target);
+                if (lockPos) chain.target.set(lockPos);
+                else chain.target.set(hold.localPos);
             } else {
                 const lockPos = hold.getAdsorbedPosition(chain.target);
                 if (lockPos) chain.target.set(lockPos);
@@ -1244,22 +1371,45 @@ export class Player extends Component {
                 const shoulderPos = new Vec2(hipX + this.torsoLean + shoulderDx, hipY + shoulderOffsetY);
                 const maxLen = arm.upperLen + arm.lowerLen;
 
-                let targetX: number, targetY: number;
                 if (hold.type === HoldType.VOLUME) {
-                    const lineTarget = hold.getClosestPointOnVolumeLine(arm.target) ?? arm.target.clone();
-                    targetX = lineTarget.x - shoulderDx;
-                    targetY = lineTarget.y - shoulderOffsetY;
+                    // Volume：检查肩膀是否能到达 Volume 线段上的任意点
+                    // 取线段两端点，看肩膀能否到达其中至少一个
+                    const segment = hold.getVolumeLineSegment();
+                    if (segment) {
+                        const distToStart = Vec2.distance(shoulderPos, segment.start);
+                        const distToEnd = Vec2.distance(shoulderPos, segment.end);
+                        const minDistToVolume = Math.min(distToStart, distToEnd);
+                        // 如果肩膀到 Volume 最近端点的距离超过臂长，需要约束
+                        if (minDistToVolume > maxLen) {
+                            // 找 Volume 上离肩膀最近的可达点
+                            const closestOnLine = hold.getClosestPointOnVolumeLine(shoulderPos);
+                            if (closestOnLine) {
+                                const dx = shoulderPos.x - closestOnLine.x;
+                                const dy = shoulderPos.y - closestOnLine.y;
+                                const dist = Math.sqrt(dx * dx + dy * dy);
+                                if (dist > maxLen && dist > 0.001) {
+                                    // 约束髋部使肩膀能到达 Volume
+                                    const constrainedShoulderX = closestOnLine.x + (dx / dist) * maxLen;
+                                    const constrainedShoulderY = closestOnLine.y + (dy / dist) * maxLen;
+                                    hipX = constrainedShoulderX - this.torsoLean - shoulderDx;
+                                    hipY = constrainedShoulderY - shoulderOffsetY;
+                                }
+                            }
+                        }
+                        // 如果 minDistToVolume <= maxLen，肩膀能到达 Volume，不约束
+                    }
                 } else {
-                    targetX = arm.target.x - shoulderDx;
-                    targetY = arm.target.y - shoulderOffsetY;
-                }
+                    // 点吸附：使用固定岩点位置约束
+                    const targetX = arm.target.x - shoulderDx;
+                    const targetY = arm.target.y - shoulderOffsetY;
 
-                const dx = hipX - targetX;
-                const dy = hipY - targetY;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist > maxLen) {
-                    hipX = targetX + (dx / dist) * maxLen;
-                    hipY = targetY + (dy / dist) * maxLen;
+                    const dx = hipX - targetX;
+                    const dy = hipY - targetY;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist > maxLen) {
+                        hipX = targetX + (dx / dist) * maxLen;
+                        hipY = targetY + (dy / dist) * maxLen;
+                    }
                 }
             }
         }
@@ -1276,31 +1426,51 @@ export class Player extends Component {
         this.rightLeg.root.set(this.hip.x + hipHalfW, this.hip.y);
     }
 
+    /**
+     * 按下 W 键时调用：逐步减小 torsoLean 直到双臂仍能到达各自锁定目标的最小角度。
+     * 如果双臂均未锁定，则直接回正到 0。
+     */
     public resetTorsoLeanIfPossible() {
         if (this.torsoLean === 0) return;
-        const previousLean = this.torsoLean;
-        const safeLean = 0;
 
+        const originalLean = this.torsoLean;
+        const leanSign = Math.sign(this.torsoLean);
         const oldLeftRoot = this.leftArm.root.clone();
         const oldRightRoot = this.rightArm.root.clone();
         const oldShoulderX = this.shoulder.x;
 
-        this.torsoLean = safeLean;
-        this.updateShoulderPositions();
-
-        const leftCanReach = this.canRootReachCurrentTarget(this.leftArm, 'leftHand');
-        const rightCanReach = this.canRootReachCurrentTarget(this.rightArm, 'rightHand');
-        if (!leftCanReach || !rightCanReach) {
-            this.torsoLean = previousLean;
-            this.shoulder.x = oldShoulderX;
-            this.leftArm.root.set(oldLeftRoot);
-            this.rightArm.root.set(oldRightRoot);
+        let bestLean = originalLean;
+        const step = 1;
+        for (let delta = step; delta <= Math.abs(originalLean); delta += step) {
+            const testLean = originalLean - leanSign * delta;
+            this.torsoLean = testLean;
             this.updateShoulderPositions();
+
+            const leftCanReach = this.canRootReachCurrentTarget(this.leftArm, 'leftHand');
+            const rightCanReach = this.canRootReachCurrentTarget(this.rightArm, 'rightHand');
+
+            if (leftCanReach && rightCanReach) {
+                bestLean = testLean;
+                if (testLean === 0) break;
+            } else {
+                break;
+            }
+        }
+
+        if (bestLean !== originalLean) {
+            // 成功减小了角度
+            this.torsoLean = bestLean;
+            this.updateShoulderPositions();
+            this.solveAllChains();
             return;
         }
 
-        // 更新目标与骨链以反映术直躯干状态
-        this.solveAllChains();
+        // 无法减小，恢复原状
+        this.torsoLean = originalLean;
+        this.shoulder.x = oldShoulderX;
+        this.leftArm.root.set(oldLeftRoot);
+        this.rightArm.root.set(oldRightRoot);
+        this.updateShoulderPositions();
     }
 
     private tryReduceTorsoLean(): boolean {
