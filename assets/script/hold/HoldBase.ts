@@ -90,7 +90,7 @@ export class HoldBase extends Component {
         return null;
     }
 
-    private getVolumeAdsorbPos(worldTarget: Vec2): Vec2 | null {
+    private getVolumeAdhesionParams(): { center: Vec2; cos: number; sin: number; halfW: number; halfH: number } | null {
         const uiTransform = this.node.getComponent(UITransform);
         if (!uiTransform) return null;
 
@@ -109,28 +109,31 @@ export class HoldBase extends Component {
         const centerX = pos.x + cos * offsetX - sin * offsetY;
         const centerY = pos.y + sin * offsetX + cos * offsetY;
 
-        const halfW = w / 2 + this.volumeMargin;
-        const halfH = h / 2 + this.volumeMargin;
+        return {
+            center: new Vec2(centerX, centerY),
+            cos,
+            sin,
+            halfW: w / 2 + this.volumeMargin,
+            halfH: h / 2 + this.volumeMargin,
+        };
+    }
 
-        const dx = worldTarget.x - centerX;
-        const dy = worldTarget.y - centerY;
-        const localX = dx * cos + dy * sin;
-        const localY = -dx * sin + dy * cos;
+    private getVolumeAdsorbPos(worldTarget: Vec2): Vec2 | null {
+        const params = this.getVolumeAdhesionParams();
+        if (!params) return null;
 
-        if (Math.abs(localX) > halfW || Math.abs(localY) > halfH) {
+        const dx = worldTarget.x - params.center.x;
+        const dy = worldTarget.y - params.center.y;
+        const localX = dx * params.cos + dy * params.sin;
+        const localY = -dx * params.sin + dy * params.cos;
+
+        if (Math.abs(localX) > params.halfW || Math.abs(localY) > params.halfH) {
             return null;
         }
 
-        const lineStartLocalX = -halfW;
-        const lineEndLocalX = halfW;
-        const worldStartX = centerX + cos * lineStartLocalX - sin * 0;
-        const worldStartY = centerY + sin * lineStartLocalX + cos * 0;
-        const worldEndX = centerX + cos * lineEndLocalX - sin * 0;
-        const worldEndY = centerY + sin * lineEndLocalX + cos * 0;
-        const worldStart = new Vec2(worldStartX, worldStartY);
-        const worldEnd = new Vec2(worldEndX, worldEndY);
-
-        return this.closestPointOnSegment(worldTarget, worldStart, worldEnd);
+        const segment = this.getVolumeLineSegment();
+        if (!segment) return null;
+        return this.closestPointOnSegment(worldTarget, segment.start, segment.end);
     }
 
     // ========== 脱离判断 ==========
@@ -144,45 +147,19 @@ export class HoldBase extends Component {
 
     isInReleaseRange(target: Vec2): boolean {
         if (this.type === HoldType.VOLUME) {
-            const uiTransform = this.node.getComponent(UITransform);
-            if (!uiTransform) return true;
+            const params = this.getVolumeAdhesionParams();
+            if (!params) return true;
 
-            const pos = this.node.position;
-            const angle = this.node.angle * Math.PI / 180;
-            const scale = this.node.scale;
-            const cos = Math.cos(angle);
-            const sin = Math.sin(angle);
-            const w = uiTransform.width * scale.x;
-            const h = uiTransform.height * scale.y;
-            const ax = uiTransform.anchorX;
-            const ay = uiTransform.anchorY;
+            const dx = target.x - params.center.x;
+            const dy = target.y - params.center.y;
+            const localX = dx * params.cos + dy * params.sin;
+            const localY = -dx * params.sin + dy * params.cos;
 
-            const offsetX = (0.5 - ax) * w;
-            const offsetY = (0.5 - ay) * h;
-            const centerX = pos.x + cos * offsetX - sin * offsetY;
-            const centerY = pos.y + sin * offsetX + cos * offsetY;
+            if (Math.abs(localX) > params.halfW || Math.abs(localY) > params.halfH) return true;
 
-            const halfW = w / 2 + this.volumeMargin;
-            const halfH = h / 2 + this.volumeMargin;
-
-            const dx = target.x - centerX;
-            const dy = target.y - centerY;
-            const localX = dx * cos + dy * sin;
-            const localY = -dx * sin + dy * cos;
-
-            if (Math.abs(localX) > halfW || Math.abs(localY) > halfH) return true;
-
-            const lineStartLocalX = -halfW;
-            const lineEndLocalX = halfW;
-            const worldStart = new Vec2(
-                centerX + cos * lineStartLocalX,
-                centerY + sin * lineStartLocalX
-            );
-            const worldEnd = new Vec2(
-                centerX + cos * lineEndLocalX,
-                centerY + sin * lineEndLocalX
-            );
-            const closest = this.closestPointOnSegment(target, worldStart, worldEnd);
+            const segment = this.getVolumeLineSegment();
+            if (!segment) return true;
+            const closest = this.closestPointOnSegment(target, segment.start, segment.end);
             return Vec2.distance(target, closest) > this.releaseRadius;
         } else {
             return Vec2.distance(target, this.localPos) > this.releaseRadius;

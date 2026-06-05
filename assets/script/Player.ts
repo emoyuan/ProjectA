@@ -769,7 +769,7 @@ export class Player extends Component {
                             const remainDy = newTargetY - chain.target.y;
                             const bodyDx = remainDx / 0.6;
                             const bodyDy = remainDy;
-                            this.moveBodyByDelta(bodyDx, bodyDy);
+                            this.moveBodyByDelta(bodyDx, bodyDy, false);
                         } else {
                             chain.target.set(root.x + (ndx / dist) * maxDist, root.y + (ndy / dist) * maxDist);
                         }
@@ -889,6 +889,7 @@ export class Player extends Component {
                 this.updateKneeAbduction();
                 this.updateArmAbduction();
                 for (const { chain } of limbs) chain.solve();
+                this.tryReduceTorsoLean();
                 return true;
             }
         }
@@ -927,7 +928,7 @@ export class Player extends Component {
         }
     }
 
-    private moveBodyByDelta(dx: number, dy: number) {
+    private moveBodyByDelta(dx: number, dy: number, reduceTorsoLean: boolean = true) {
         let newX = this.hip.x + dx * 0.6;
         let newY = this.hip.y + dy;
 
@@ -1008,6 +1009,9 @@ export class Player extends Component {
         this.updateKneeAbduction();
         this.updateArmAbduction();
         for (const { chain } of limbs) chain.solve();
+        if (reduceTorsoLean) {
+            this.tryReduceTorsoLean();
+        }
     }
 
     private isPartUnderForce(part: BodyPart): boolean {
@@ -1242,21 +1246,9 @@ export class Player extends Component {
 
                 let targetX: number, targetY: number;
                 if (hold.type === HoldType.VOLUME) {
-                    const desiredTarget = hold.getClosestPointOnVolumeLine(arm.target) ?? arm.target.clone();
-                    const currentDist = Vec2.distance(shoulderPos, desiredTarget);
-                    let linePoint = desiredTarget;
-                    if (currentDist > maxLen) {
-                        const reachable = hold.getReachablePointOnVolumeLine(shoulderPos, desiredTarget, maxLen);
-                        if (reachable) {
-                            linePoint = reachable;
-                        } else {
-                            const closestOnLine = hold.getClosestPointOnVolumeLine(shoulderPos);
-                            if (!closestOnLine) continue;
-                            linePoint = closestOnLine;
-                        }
-                    }
-                    targetX = linePoint.x - shoulderDx;
-                    targetY = linePoint.y - shoulderOffsetY;
+                    const lineTarget = hold.getClosestPointOnVolumeLine(arm.target) ?? arm.target.clone();
+                    targetX = lineTarget.x - shoulderDx;
+                    targetY = lineTarget.y - shoulderOffsetY;
                 } else {
                     targetX = arm.target.x - shoulderDx;
                     targetY = arm.target.y - shoulderOffsetY;
@@ -1309,6 +1301,45 @@ export class Player extends Component {
 
         // 更新目标与骨链以反映术直躯干状态
         this.solveAllChains();
+    }
+
+    private tryReduceTorsoLean(): boolean {
+        if (this.torsoLean === 0) return false;
+        const originalLean = this.torsoLean;
+        const leanSign = Math.sign(this.torsoLean);
+        const oldLeftRoot = this.leftArm.root.clone();
+        const oldRightRoot = this.rightArm.root.clone();
+        const oldShoulderX = this.shoulder.x;
+
+        let bestLean = originalLean;
+        const step = 1;
+        for (let delta = step; delta <= Math.abs(originalLean); delta += step) {
+            const testLean = originalLean - leanSign * delta;
+            this.torsoLean = testLean;
+            this.updateShoulderPositions();
+            const leftCanReach = this.canRootReachCurrentTarget(this.leftArm, 'leftHand');
+            const rightCanReach = this.canRootReachCurrentTarget(this.rightArm, 'rightHand');
+            if (leftCanReach && rightCanReach) {
+                bestLean = testLean;
+                if (testLean === 0) break;
+            } else {
+                break;
+            }
+        }
+
+        if (bestLean !== originalLean) {
+            this.torsoLean = bestLean;
+            this.updateShoulderPositions();
+            this.solveAllChains();
+            return true;
+        }
+
+        this.torsoLean = originalLean;
+        this.shoulder.x = oldShoulderX;
+        this.leftArm.root.set(oldLeftRoot);
+        this.rightArm.root.set(oldRightRoot);
+        this.updateShoulderPositions();
+        return false;
     }
 
     private canRootReachCurrentTarget(chain: BoneChain, part: BodyPart): boolean {
