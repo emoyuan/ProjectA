@@ -1,5 +1,5 @@
 import { _decorator, Component, Button, Node, Vec2, Color, input, Input, EventKeyboard, KeyCode } from 'cc';
-import { Player, BodyPart } from './Player';
+import { Player, BodyPart } from '../Player';
 import { Joystick } from './Joystick';
 
 const { ccclass, property } = _decorator;
@@ -59,7 +59,7 @@ export class UIController extends Component {
             });
         }
 
-        this.selectPart(0);
+        this.selectPart(4); // 默认选中身体(torso)
 
         // 键盘监听（使用新的 input API）
         input.on(Input.EventType.KEY_DOWN, this.onKeyDown, this);
@@ -214,8 +214,8 @@ export class UIController extends Component {
         // 1. 将角色恢复到初始姿势（清除吸附、偏移、侧身等）
         this.player.resetToInitialPose();
 
-        // 2. UI 选中第一个部件
-        this.selectPart(0);
+        // 2. UI 默认选中身体(torso)
+        this.selectPart(4);
         this.updateFollowButtonAppearance();
     }
 }

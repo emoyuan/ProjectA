@@ -160,7 +160,7 @@ export class Player extends Component {
     holdManager: HoldManager = null!;
 
     @property({ tooltip: '角色整体缩放比例' })
-    scaleFactor: number = 1.0;
+    scaleFactor: number = 0.6;
 
     @property({ tooltip: '手部末端绘制半径' })
     handEndRadius: number = 9;   // 原 jointRadius(7) + 2
@@ -215,7 +215,7 @@ export class Player extends Component {
     leftLeg: BoneChain = null!;
     rightLeg: BoneChain = null!;
 
-    activePart: BodyPart = 'leftHand';
+    activePart: BodyPart = 'torso';
     followBodyWithArm: boolean = true;
 
     upperArmLen: number = 98;
@@ -243,6 +243,8 @@ export class Player extends Component {
     private adsorbedHold: Map<BodyPart, HoldBase> = new Map();
     // 记录每个手臂超出角度的累计时间（毫秒）
     private forceAngleTimer: Map<BodyPart, number> = new Map();
+    // ★ 记录因超时脱落的岩点（肢体 -> 岩点），该肢体继续操作时可无视冷却重新吸附
+    private timeoutReleasedHold: Map<BodyPart, HoldBase> = new Map();
 
     appearance: CharacterAppearance = {
         skinColor: new Color(255, 210, 170, 255),
@@ -448,8 +450,9 @@ export class Player extends Component {
 
         // 2. 重置吸附与拖拽状态
         this.adsorbedHold.clear();
+        this.timeoutReleasedHold.clear();
         this.dragOffset.set(0, 0);
-        this.activePart = 'leftHand';
+        this.activePart = 'torso';
 
         // 3. 计算地平线位置（与 start 中一致）
         let targetGroundY = -800 * s;
@@ -659,11 +662,12 @@ export class Player extends Component {
     }
 
     /**
-     * 质心水平投影是否在支撑区间内
+     * 质心水平投影是否在支撑区间内。
+     * 无支撑范围时返回 false（视为失衡）。
      */
     private isComOverSupport(): boolean {
         const range = this.getSupportXRange();
-        if (!range) return true; // 无支撑时不判定为失衡（由其他机制处理）
+        if (!range) return false; // 没有支撑线 = 失衡
         const comX = this.getCenterOfMass().x;
         return comX >= range.min && comX <= range.max;
     }
@@ -801,7 +805,10 @@ export class Player extends Component {
                 const maxDist = chain.upperLen + chain.lowerLen;
 
                 if (dist > maxDist) {
-                    if (!this.tryAdjustTorsoForReach(chain, newTargetX, newTargetY)) {
+                    // 脚移动不改变身体位置，直接约束到可达范围
+                    if (!chain.isArm) {
+                        chain.target.set(root.x + (ndx / dist) * maxDist, root.y + (ndy / dist) * maxDist);
+                    } else if (!this.tryAdjustTorsoForReach(chain, newTargetX, newTargetY)) {
                         if (this.followBodyWithArm && chain.isArm) {
                             const dirX = ndx / dist;
                             const dirY = ndy / dist;
@@ -820,7 +827,24 @@ export class Player extends Component {
 
                 // 自动吸附检测
                 if (this.holdManager) {
-                    const nearest = this.holdManager.findNearestHold(chain.target, true);
+                    // ★ 先检查是否有因超时脱落的岩点可重新吸附（无视冷却）
+                    const timeoutHold = this.timeoutReleasedHold.get(this.activePart);
+                    let nearest: HoldBase | null = null;
+                    if (timeoutHold) {
+                        const adsorbPos = timeoutHold.getAdsorbedPosition(chain.target);
+                        if (adsorbPos) {
+                            nearest = timeoutHold;
+                        } else {
+                            // 超时脱落的岩点已不在吸附范围内，清除记录
+                            this.timeoutReleasedHold.delete(this.activePart);
+                        }
+                    }
+
+                    // 如果没有超时脱落岩点可吸附，走正常吸附流程（排除冷却中的岩点）
+                    if (!nearest) {
+                        nearest = this.holdManager.findNearestHold(chain.target, true);
+                    }
+
                     if (nearest) {
                         const adsorbPos = nearest.getAdsorbedPosition(chain.target);
                         if (adsorbPos) {
@@ -829,6 +853,8 @@ export class Player extends Component {
                             this.dragOffset.set(0, 0);
                             this.lastAdsorbTime = Date.now();
                             this.forceAngleTimer.delete(this.activePart);
+                            // ★ 成功重新吸附后清除超时脱落记录
+                            this.timeoutReleasedHold.delete(this.activePart);
                             if (chain.isArm && nearest.type !== HoldType.VOLUME) {
                                 chain.preferVertical = true;
                                 chain.maxVerticalAngle = 15;
@@ -846,11 +872,21 @@ export class Player extends Component {
             }
 
             case 'torso': {
+                // ★ 身体移动限制：没有支撑线则无法移动身体
+                const supportRange = this.getSupportXRange();
+                if (!supportRange) return false;
+
                 let newX = this.hip.x + dx * 0.6;
                 let newY = this.hip.y + dy;
 
                 let valid = this.clampHipToAdsorbedLegs(newX, newY);
                 valid = this.clampHipToAdsorbedArms(valid.x, valid.y);
+
+                // ★ 需求1：没有任何锁定点时，脚站在地面上不能离开地面
+                // 通过约束髋部位置来确保脚不离开地面
+                if (this.hasNoLockedHolds()) {
+                    valid = this.clampHipToGroundFeet(valid.x, valid.y);
+                }
 
                 // 髋部连线距离限制
                 const footA = this.leftLeg.target;
@@ -892,6 +928,9 @@ export class Player extends Component {
                     { chain: this.rightLeg, part: 'rightFoot' },
                 ];
 
+                // ★ 需求1：没有任何锁定点时，站在地面上的脚保持Y在地面，但可沿地面水平滑动
+                const noHoldsAndFeetOnGround = this.hasNoLockedHolds() && this.hasAnyFootOnGround();
+
                 const savedVectors: Map<BodyPart, Vec2> = new Map();
                 for (const { chain, part } of limbs) {
                     if (!this.adsorbedHold.has(part)) {
@@ -907,7 +946,15 @@ export class Player extends Component {
                 for (const { chain, part } of limbs) {
                     if (!this.adsorbedHold.has(part)) {
                         const rel = savedVectors.get(part);
-                        if (rel) chain.target.set(chain.root.x + rel.x, chain.root.y + rel.y);
+                        if (rel) {
+                            chain.target.set(chain.root.x + rel.x, chain.root.y + rel.y);
+                        }
+                        // 脚在地面上：锁定Y到地面，但允许X随身体滑动
+                        if (noHoldsAndFeetOnGround && this.isFootOnGround(part)) {
+                            chain.target.y = this.groundY;
+                            // 确保脚在腿长可达范围内：如果髋部到地面点的距离超过腿长，沿X拉回
+                            this.clampFootToGroundReach(chain);
+                        }
                     }
                 }
 
@@ -948,24 +995,6 @@ export class Player extends Component {
                 root.x + (dx / dist) * maxDist,
                 root.y + (dy / dist) * maxDist
             );
-        }
-    }
-
-    private updateVolumeLockedArmTargets() {
-        for (const part of ['leftHand', 'rightHand'] as const) {
-            const hold = this.adsorbedHold.get(part);
-            if (!hold || hold.type !== HoldType.VOLUME) continue;
-            const chain = this.getChainByPart(part);
-            if (!chain) continue;
-            const desiredTarget = hold.getClosestPointOnVolumeLine(chain.target) ?? chain.target.clone();
-            const reachablePoint = hold.getReachablePointOnVolumeLine(chain.root, desiredTarget, chain.upperLen + chain.lowerLen);
-            if (reachablePoint) {
-                chain.target.set(reachablePoint);
-            } else if (desiredTarget) {
-                chain.target.set(desiredTarget);
-            } else {
-                chain.target.set(hold.localPos);
-            }
         }
     }
 
@@ -1041,11 +1070,20 @@ export class Player extends Component {
     }
 
     private moveBodyByDelta(dx: number, dy: number, reduceTorsoLean: boolean = true) {
+        // ★ 身体移动限制：没有支撑线则无法移动身体
+        const supportRange = this.getSupportXRange();
+        if (!supportRange) return;
+
         let newX = this.hip.x + dx * 0.6;
         let newY = this.hip.y + dy;
 
         let valid = this.clampHipToAdsorbedLegs(newX, newY);
         valid = this.clampHipToAdsorbedArms(valid.x, valid.y);
+
+        // ★ 需求1：没有任何锁定点时，脚站在地面上不能离开地面
+        if (this.hasNoLockedHolds()) {
+            valid = this.clampHipToGroundFeet(valid.x, valid.y);
+        }
 
         // 髋部连线距离限制（与 torso 保持一致）
         const applyHipConstraint = (x: number, y: number): Vec2 => {
@@ -1104,9 +1142,18 @@ export class Player extends Component {
             { chain: this.rightLeg, part: 'rightFoot' },
         ];
 
+        // ★ 需求1：没有任何锁定点时，站在地面上的脚Y锁定在地面，X可随身体滑动
+        const noHoldsAndFeetOnGround = this.hasNoLockedHolds() && this.hasAnyFootOnGround();
+
         for (const { chain, part } of limbs) {
             if (!this.adsorbedHold.has(part)) {
                 chain.target.add(delta);
+                // 脚在地面上：锁定Y到地面，但允许X随身体滑动
+                if (noHoldsAndFeetOnGround && this.isFootOnGround(part)) {
+                    chain.target.y = this.groundY;
+                    // 确保脚在腿长可达范围内
+                    this.clampFootToGroundReach(chain);
+                }
             }
         }
 
@@ -1141,6 +1188,31 @@ export class Player extends Component {
         }
     }
 
+    /**
+     * 检查脚是否在地面上（未吸附到岩点，但在接地容忍范围内）
+     */
+    private isFootOnGround(part: BodyPart): boolean {
+        if (part !== 'leftFoot' && part !== 'rightFoot') return false;
+        if (this.adsorbedHold.has(part)) return false; // 吸附在岩点上不算"站在地面上"
+        const chain = this.getChainByPart(part);
+        if (!chain) return false;
+        return Math.abs(chain.target.y - this.groundY) < this.groundStandTolerance;
+    }
+
+    /**
+     * 检查是否有任何脚站在地面上（未吸附）
+     */
+    private hasAnyFootOnGround(): boolean {
+        return this.isFootOnGround('leftFoot') || this.isFootOnGround('rightFoot');
+    }
+
+    /**
+     * 检查是否没有任何锁定点（手脚都没有吸附到岩点）
+     */
+    private hasNoLockedHolds(): boolean {
+        return this.adsorbedHold.size === 0;
+    }
+
     private isPartUnderForce(part: BodyPart): boolean {
         const hold = this.adsorbedHold.get(part);
         if (!hold) return false;
@@ -1160,6 +1232,86 @@ export class Player extends Component {
         pullDir.normalize();
 
         return hold.isForceInRange(pullDir);
+    }
+
+    /**
+     * ★ 需求1：没有任何锁定点时，约束髋部使站在地面上的脚不离开地面。
+     * 对于每只在地面上的脚，髋部到该脚的距离不能超过腿长。
+     */
+    private clampHipToGroundFeet(hipX: number, hipY: number): Vec2 {
+        const hipHalfW = this.appearance.torsoWidth * 0.35 * this.scaleFactor;
+
+        const groundFeet: { leg: BoneChain; hipDx: number }[] = [];
+        if (this.isFootOnGround('leftFoot')) {
+            groundFeet.push({ leg: this.leftLeg, hipDx: -hipHalfW });
+        }
+        if (this.isFootOnGround('rightFoot')) {
+            groundFeet.push({ leg: this.rightLeg, hipDx: hipHalfW });
+        }
+        if (groundFeet.length === 0) return new Vec2(hipX, hipY);
+
+        for (let iter = 0; iter < 2; iter++) {
+            for (const { leg, hipDx } of groundFeet) {
+                const maxLen = leg.upperLen + leg.lowerLen;
+                // 脚在地面上的目标位置
+                const targetX = leg.target.x;
+                const targetY = leg.target.y;
+                // 髋部连接点 = hip + hipDx
+                const rootX = hipX + hipDx;
+                const rootY = hipY;
+
+                const dx = rootX - targetX;
+                const dy = rootY - targetY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > maxLen) {
+                    // 约束髋部使腿能够到达脚
+                    const constrainedRootX = targetX + (dx / dist) * maxLen;
+                    const constrainedRootY = targetY + (dy / dist) * maxLen;
+                    hipX = constrainedRootX - hipDx;
+                    hipY = constrainedRootY;
+                }
+            }
+        }
+        return new Vec2(hipX, hipY);
+    }
+
+    /**
+     * ★ 确保脚在地面上的目标点在腿长可达范围内。
+     * 脚Y已锁定在groundY，如果髋部到该点的距离超过腿长，沿X方向将脚拉近。
+     */
+    private clampFootToGroundReach(chain: BoneChain) {
+        const maxLen = chain.upperLen + chain.lowerLen;
+        const root = chain.root;
+        const dx = chain.target.x - root.x;
+        const dy = chain.target.y - root.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > maxLen && dist > 0.001) {
+            // 保持Y在地面，沿X方向拉回到可达范围
+            // 已知 target.y = groundY，求 target.x 使距离 = maxLen
+            // (target.x - root.x)^2 + (groundY - root.y)^2 = maxLen^2
+            const dyGround = chain.target.y - root.y;
+            const maxDx = Math.sqrt(Math.max(0, maxLen * maxLen - dyGround * dyGround));
+            // 保持方向，但限制X偏移
+            const sign = dx >= 0 ? 1 : -1;
+            chain.target.x = root.x + sign * Math.min(Math.abs(dx), maxDx);
+        }
+    }
+
+    /**
+     * ★ 每帧调用：确保所有未吸附到岩点的脚不低于地面。
+     * 如果脚Y低于groundY，将其钳制到groundY，并确保在腿长可达范围内。
+     */
+    private clampFeetAboveGround() {
+        for (const part of ['leftFoot', 'rightFoot'] as BodyPart[]) {
+            if (this.adsorbedHold.has(part)) continue; // 吸附在岩点上的脚不受地面限制
+            const chain = this.getChainByPart(part);
+            if (!chain) continue;
+            if (chain.target.y < this.groundY) {
+                chain.target.y = this.groundY;
+                // 钳制后确保可达
+                this.clampFootToGroundReach(chain);
+            }
+        }
     }
 
     private clampHipToAdsorbedLegs(hipX: number, hipY: number): Vec2 {
@@ -1226,7 +1378,7 @@ export class Player extends Component {
                 const currentTimer = this.forceAngleTimer.get(part) || 0;
                 const newTimer = currentTimer + dt * 1000;
                 if (newTimer >= this.forceAngleToleranceTime * 1000) {
-                    this.releaseHoldAndCooldown(part);
+                    this.releaseHoldAndCooldown(part, true);
                     this.forceAngleTimer.delete(part);
                 } else {
                     this.forceAngleTimer.set(part, newTimer);
@@ -1289,21 +1441,35 @@ export class Player extends Component {
     private getSupportPoints(): Vec2[] {
         const points: Vec2[] = [];
 
-        // 左脚支撑
+        // 左脚支撑：吸附在岩点上 或 站在地面上
         if (this.adsorbedHold.has('leftFoot')) {
             const hold = this.adsorbedHold.get('leftFoot')!;
             if (hold.allowFootStand) {
                 points.push(this.leftLeg.target.clone());
             }
+        } else if (Math.abs(this.leftLeg.target.y - this.groundY) < this.groundStandTolerance) {
+            // 脚在地面上也算支撑点
+            points.push(this.leftLeg.target.clone());
         }
-        // 右脚支撑
+
+        // 右脚支撑：吸附在岩点上 或 站在地面上
         if (this.adsorbedHold.has('rightFoot')) {
             const hold = this.adsorbedHold.get('rightFoot')!;
             if (hold.allowFootStand) {
                 points.push(this.rightLeg.target.clone());
             }
+        } else if (Math.abs(this.rightLeg.target.y - this.groundY) < this.groundStandTolerance) {
+            // 脚在地面上也算支撑点
+            points.push(this.rightLeg.target.clone());
         }
-        // 未来可扩展手部支撑（需额外判断）
+
+        // 手部支撑（锁定且受力良好）
+        for (const part of ['leftHand', 'rightHand'] as BodyPart[]) {
+            if (this.adsorbedHold.has(part) && this.isPartUnderForce(part)) {
+                points.push(this.getChainByPart(part)!.target.clone());
+            }
+        }
+
         return points;
     }
 
@@ -1530,13 +1696,17 @@ export class Player extends Component {
         return false;
     }
 
-    public releaseHoldAndCooldown(part: BodyPart) {
+    public releaseHoldAndCooldown(part: BodyPart, fromTimeout: boolean = false) {
         const hold = this.adsorbedHold.get(part);
         if (hold) {
             this.adsorbedHold.delete(part);
             this.dragOffset.set(0, 0);
             this.holdManager.startCooldown(hold);       // 岩点冷却
             this.forceAngleTimer.delete(part);          // ★ 清除超限计时
+            // ★ 只有因超时脱落才记录，允许该肢体继续操作时无视冷却重新吸附
+            if (fromTimeout) {
+                this.timeoutReleasedHold.set(part, hold);
+            }
             const chain = this.getChainByPart(part);
             if (chain && chain.isArm) {
                 chain.preferVertical = false;
@@ -1566,6 +1736,7 @@ export class Player extends Component {
         this.updateKneeAbduction();
         this.updateArmAbduction();
         this.solveAllChains();
+        this.clampFeetAboveGround();  // 确保所有未吸附的脚不低于地面
         this.checkArmForceAngles(dt);
         this.checkBalance(dt);     
         this.drawCharacter();
