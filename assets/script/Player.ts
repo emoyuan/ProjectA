@@ -353,6 +353,12 @@ export class Player extends Component {
 
         // 8. 使用平移后的坐标初始化骨链
         this.initBoneChains(leftHandTarget, rightHandTarget, leftFootTarget, rightFootTarget);
+
+        // 确保 HoldManager 在开始时处于未起步状态
+        if (this.holdManager) {
+            this.holdManager.setStarted(false);
+            this.holdManager.setFinished(false);
+        }
     }
 
     initPose() {
@@ -453,6 +459,10 @@ export class Player extends Component {
         this.timeoutReleasedHold.clear();
         this.dragOffset.set(0, 0);
         this.activePart = 'torso';
+        if (this.holdManager) {
+            this.holdManager.setStarted(false);
+            this.holdManager.setFinished(false);
+        }
 
         // 3. 计算地平线位置（与 start 中一致）
         let targetGroundY = -800 * s;
@@ -859,6 +869,9 @@ export class Player extends Component {
                                 chain.preferVertical = true;
                                 chain.maxVerticalAngle = 15;
                             }
+                            // 在每次成功吸附后，检查是否满足起步或结束条件
+                            this.checkStartCondition();
+                            this.checkFinishCondition();
                         }
                     }
                 }
@@ -1715,6 +1728,60 @@ export class Player extends Component {
         }
     }
 
+    /**
+     * 检查起步条件：在未起步状态下，若四肢都锁定且都位于起步点且处于合法角度，则触发起步
+     */
+    private checkStartCondition() {
+        if (!this.holdManager) return;
+        if (this.holdManager.started) return;
+
+        // 必须有四个肢体都锁定
+        const parts: BodyPart[] = ['leftHand', 'rightHand', 'leftFoot', 'rightFoot'];
+        for (const p of parts) {
+            if (!this.adsorbedHold.has(p)) return;
+        }
+
+        // 检查每个锁定点是否为起步点，以及角度是否合法
+        for (const p of parts) {
+            const hold = this.adsorbedHold.get(p)!;
+            if (!hold.isStartPoint) return;
+            if (p === 'leftHand' || p === 'rightHand') {
+                if (!this.isPartUnderForce(p)) return;
+            } else {
+                // 脚：至少需要允许站立/钩挂其中一种
+                if (!hold.allowFootStand && !hold.allowFootHook) return;
+            }
+        }
+
+        // 满足起步条件
+        this.holdManager.setStarted(true);
+        console.log('起步成功');
+        // 可在此处发出事件，供 UI/流程逻辑监听
+        this.node.emit('gameStart');
+    }
+
+    /**
+     * 检查结束条件：已起步且未结束时，若双手都锁在同一终点且角度合法，则触发结束
+     */
+    private checkFinishCondition() {
+        if (!this.holdManager) return;
+        if (!this.holdManager.started) return;
+        if (this.holdManager.finished) return;
+
+        const left = this.adsorbedHold.get('leftHand');
+        const right = this.adsorbedHold.get('rightHand');
+        if (!left || !right) return;
+        if (left !== right) return;
+        if (!left.isFinishPoint) return;
+        // 双手角度必须合法
+        if (!this.isPartUnderForce('leftHand') || !this.isPartUnderForce('rightHand')) return;
+
+        // 满足结束条件
+        this.holdManager.setFinished(true);
+        console.log('到达终点，游戏结束');
+        this.node.emit('gameFinish');
+    }
+
     public toggleBodyFollow() {
         this.followBodyWithArm = !this.followBodyWithArm;
     }
@@ -1925,6 +1992,26 @@ export class Player extends Component {
                 const center = hold.localPos;
                 const radius = hold.adsorbRadius * s * 1.5;
                 this.drawForceSector(gfx, center, radius, centerDir, hold.forceAngleDown, hold.forceAngleUp, hold.forceSectorColor);
+            }
+            // 额外：为 Volume 岩点绘制线段（调试用，便于观察坐标和方向）
+            for (const hold of allHolds) {
+                if (hold.type !== HoldType.VOLUME) continue;
+                const seg = hold.getVolumeLineSegment();
+                if (!seg) continue;
+                // 线段
+                gfx.lineWidth = 3 * s;
+                gfx.strokeColor = new Color(0, 120, 255, 200);
+                gfx.moveTo(seg.start.x, seg.start.y);
+                gfx.lineTo(seg.end.x, seg.end.y);
+                gfx.stroke();
+                // 端点标记
+                gfx.fillColor = new Color(0, 120, 255, 200);
+                gfx.circle(seg.start.x, seg.start.y, 6 * s); gfx.fill();
+                gfx.circle(seg.end.x, seg.end.y, 6 * s); gfx.fill();
+                // 中心点
+                const center = new Vec2((seg.start.x + seg.end.x) / 2, (seg.start.y + seg.end.y) / 2);
+                gfx.fillColor = new Color(0, 200, 120, 180);
+                gfx.circle(center.x, center.y, 5 * s); gfx.fill();
             }
         }
 

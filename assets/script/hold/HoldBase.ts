@@ -39,6 +39,12 @@ export class HoldBase extends Component {
     @property({ type: Color, tooltip: '力方向扇形颜色' })
     forceSectorColor: Color = new Color(255, 200, 0, 200);  // 黄色半透明
 
+    @property({ tooltip: '是否为起步点（起步前仅允许与此类岩点交互）' })
+    isStartPoint: boolean = false;
+
+    @property({ tooltip: '是否为终点（完成条件通常要求双手锁在同一终点）' })
+    isFinishPoint: boolean = false;
+
     public localPos: Vec2 = new Vec2();
     public cooldownTimer: number = 0;
 
