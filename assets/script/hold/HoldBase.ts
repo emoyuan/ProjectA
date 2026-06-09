@@ -1,7 +1,7 @@
 import { _decorator, Component, Vec2, UITransform, Enum, Color } from 'cc';
 const { ccclass, property } = _decorator;
 
-export enum HoldType { JUG, POCKET, CRIMP, VOLUME }
+export enum HoldType { JUG, POCKET, CRIMP, VOLUME, FOOTHOLD }
 
 @ccclass('HoldBase')
 export class HoldBase extends Component {
@@ -15,6 +15,9 @@ export class HoldBase extends Component {
     @property({ tooltip: '释放半径' })
     releaseRadius: number = 60;
 
+    @property({ tooltip: '磁力半径（大于吸附半径，进入此范围手脚开始被吸引减速，0=关闭磁力）' })
+    magnetRadius: number = 80;
+
     @property({ tooltip: '冷却时间（秒）' })
     cooldownTime: number = 2.0;
 
@@ -22,10 +25,10 @@ export class HoldBase extends Component {
     @property({ tooltip: 'Volume 吸附额外边距（扩大矩形）', visible() { return this.type === HoldType.VOLUME; } })
     volumeMargin: number = 10;
 
-    @property({ tooltip: '从中心方向（向下）向下扩展的角度（度）' })
+    @property({ tooltip: '从中心方向（向下）向下扩展的角度（度）', visible() { return this.type !== HoldType.FOOTHOLD; } })
     forceAngleDown: number = 45;
 
-    @property({ tooltip: '从中心方向（向下）向上扩展的角度（度）' })
+    @property({ tooltip: '从中心方向（向下）向上扩展的角度（度）', visible() { return this.type !== HoldType.FOOTHOLD; } })
     forceAngleUp: number = 45;
 
     // 脚的使用权限（会在 start 中根据 type 自动覆盖）
@@ -36,7 +39,7 @@ export class HoldBase extends Component {
     allowFootHook: boolean = true;
 
     // 在 forceAngleRange 属性下方添加
-    @property({ type: Color, tooltip: '力方向扇形颜色' })
+    @property({ type: Color, tooltip: '力方向扇形颜色', visible() { return this.type !== HoldType.FOOTHOLD; } })
     forceSectorColor: Color = new Color(255, 200, 0, 200);  // 黄色半透明
 
     @property({ tooltip: '是否为起步点（起步前仅允许与此类岩点交互）' })
@@ -78,6 +81,12 @@ export class HoldBase extends Component {
                 this.allowFootStand = true;
                 this.allowFootHook = true;
                 break;
+            case HoldType.FOOTHOLD:
+                this.allowFootStand = true;
+                this.allowFootHook = false;
+                this.forceAngleDown = 0;
+                this.forceAngleUp = 0;
+                break;
         }
     }
 
@@ -94,6 +103,61 @@ export class HoldBase extends Component {
         const dist = Vec2.distance(worldTarget, this.localPos);
         if (dist < this.adsorbRadius) return this.localPos.clone();
         return null;
+    }
+
+    /**
+     * 判断岩点能否被指定肢体抓取/踩踏。
+     * FOOTHOLD 只能被脚锁定；其他岩点手脚均可。
+     * @param isFoot 是否为脚部肢体
+     */
+    canBeGrabbedBy(isFoot: boolean): boolean {
+        if (this.type === HoldType.FOOTHOLD) return isFoot;
+        return true;
+    }
+
+    /**
+     * 磁力修正：手脚在磁力半径内但未到吸附半径时，对摇杆输入 delta 做减速+方向偏转。
+     * @param target 当前肢体 target 位置
+     * @param inputDelta 摇杆原始输入位移
+     * @returns 修正后的位移，null 表示不在磁力区间内（正常移动）
+     */
+    getMagnetForce(target: Vec2, inputDelta: Vec2): Vec2 | null {
+        if (this.magnetRadius <= 0) return null;
+        if (this.type === HoldType.VOLUME) {
+            // Volume 岩点：基于到线段最近点的距离判断
+            const segment = this.getVolumeLineSegment();
+            if (!segment) return null;
+            const closest = this.closestPointOnSegment(target, segment.start, segment.end);
+            const dist = Vec2.distance(target, closest);
+            if (dist >= this.magnetRadius || dist < this.adsorbRadius) return null;
+            return this.computeMagnetDelta(target, closest, dist, inputDelta);
+        } else {
+            const dist = Vec2.distance(target, this.localPos);
+            if (dist >= this.magnetRadius || dist < this.adsorbRadius) return null;
+            return this.computeMagnetDelta(target, this.localPos, dist, inputDelta);
+        }
+    }
+
+    private computeMagnetDelta(target: Vec2, attractPoint: Vec2, dist: number, inputDelta: Vec2): Vec2 {
+        const t = (dist - this.adsorbRadius) / (this.magnetRadius - this.adsorbRadius); // 0=即将吸附, 1=刚进入磁力区
+        // 速度衰减：越靠近岩点越慢（最慢30%，最快100%）
+        const speedScale = 0.3 + t * 0.7;
+        // 方向偏转力度：越靠近岩点被拉得越多（最多40%的力量拉向岩点）
+        const pullStrength = (1 - t) * 0.4;
+
+        const toHoldX = attractPoint.x - target.x;
+        const toHoldY = attractPoint.y - target.y;
+        const toHoldLen = Math.sqrt(toHoldX * toHoldX + toHoldY * toHoldY);
+        if (toHoldLen < 0.001) return inputDelta.multiplyScalar(speedScale);
+
+        const inputLen = inputDelta.length();
+        const pullX = (toHoldX / toHoldLen) * inputLen * pullStrength;
+        const pullY = (toHoldY / toHoldLen) * inputLen * pullStrength;
+
+        return new Vec2(
+            inputDelta.x * speedScale + pullX,
+            inputDelta.y * speedScale + pullY
+        );
     }
 
     private getVolumeAdhesionParams(): { center: Vec2; cos: number; sin: number; halfW: number; halfH: number } | null {
@@ -305,6 +369,8 @@ export class HoldBase extends Component {
     }
 
     public isForceInRange(worldPullDir: Vec2): boolean {
+        // 无角度限制（forceAngleDown 和 forceAngleUp 均为 0）：始终合法
+        if (this.forceAngleDown <= 0 && this.forceAngleUp <= 0) return true;
         const centerDir = this.getWorldForceDirection(); // 默认向下
         const cross = centerDir.x * worldPullDir.y - centerDir.y * worldPullDir.x;
         const dot = centerDir.x * worldPullDir.x + centerDir.y * worldPullDir.y;

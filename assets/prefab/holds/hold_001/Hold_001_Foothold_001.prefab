@@ -1,7 +1,7 @@
 [
   {
     "__type__": "cc.Prefab",
-    "_name": "Hold_001_Jug_001",
+    "_name": "Hold_001_Foothold_001",
     "_objFlags": 0,
     "__editorExtras__": {},
     "_native": "",
@@ -13,7 +13,7 @@
   },
   {
     "__type__": "cc.Node",
-    "_name": "Hold_001_Jug_001",
+    "_name": "Hold_001_Foothold_001",
     "_objFlags": 0,
     "__editorExtras__": {},
     "_parent": null,
@@ -107,9 +107,9 @@
     "_dstBlendFactor": 4,
     "_color": {
       "__type__": "cc.Color",
-      "r": 255,
-      "g": 255,
-      "b": 255,
+      "r": 47,
+      "g": 114,
+      "b": 10,
       "a": 255
     },
     "_spriteFrame": {
@@ -147,10 +147,10 @@
     "__prefab": {
       "__id__": 7
     },
-    "type": 0,
-    "adsorbRadius": 30,
-    "releaseRadius": 30,
-    "magnetRadius": 60,
+    "type": 4,
+    "adsorbRadius": 20,
+    "releaseRadius": 20,
+    "magnetRadius": 40,
     "cooldownTime": 2,
     "volumeMargin": 10,
     "forceAngleDown": 60,

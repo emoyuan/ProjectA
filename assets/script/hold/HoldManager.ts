@@ -1,5 +1,5 @@
 import { _decorator, Component, UITransform, Vec2, Sprite, Color } from 'cc';
-import { HoldBase } from './HoldBase';
+import { HoldBase, HoldType } from './HoldBase';
 const { ccclass, property } = _decorator;
 
 @ccclass('HoldManager')
@@ -29,7 +29,7 @@ export class HoldManager extends Component {
         }
     }
 
-    findNearestHold(target: Vec2, excludeCooldown: boolean = false): HoldBase | null {
+    findNearestHold(target: Vec2, excludeCooldown: boolean = false, isFoot: boolean = false): HoldBase | null {
         if (this.finished) return null;
         let bestHold: HoldBase = null;
         let bestDist = Infinity;
@@ -37,6 +37,8 @@ export class HoldManager extends Component {
             // 起步前仅允许起步点被交互
             if (!this.started && !hold.isStartPoint) continue;
             if (excludeCooldown && hold.cooldownTimer > 0) continue;
+            // FOOTHOLD 只能被脚锁定
+            if (!hold.canBeGrabbedBy(isFoot)) continue;
             const adsorbPos = hold.getAdsorbedPosition(target);
             if (adsorbPos) {
                 const dist = Vec2.distance(target, adsorbPos);
@@ -47,6 +49,43 @@ export class HoldManager extends Component {
             }
         }
         return bestHold;
+    }
+
+    /**
+     * 查找磁力范围内最近的非冷却岩点（用于磁力减速）。
+     * 返回吸附距离最小的那个，距离用于确定磁力强度。
+     */
+    findBestMagnetHold(target: Vec2, isFoot: boolean = false): { hold: HoldBase; dist: number } | null {
+        if (this.finished) return null;
+        let bestHold: HoldBase = null;
+        let bestDist = Infinity;
+        for (const hold of this.holds) {
+            if (!this.started && !hold.isStartPoint) continue;
+            if (hold.cooldownTimer > 0) continue;
+            if (hold.magnetRadius <= 0) continue;
+            // FOOTHOLD 只能被脚锁定
+            if (!hold.canBeGrabbedBy(isFoot)) continue;
+
+            if (hold.type === HoldType.VOLUME) {
+                // Volume: 计算到线段最近点的距离
+                const segment = (hold as any).getVolumeLineSegment?.();
+                if (!segment) continue;
+                const closestPoint = hold.getClosestPointOnVolumeLine(target);
+                if (!closestPoint) continue;
+                const dist = Vec2.distance(target, closestPoint);
+                if (dist < hold.magnetRadius && dist >= hold.adsorbRadius && dist < bestDist) {
+                    bestDist = dist;
+                    bestHold = hold;
+                }
+            } else {
+                const dist = Vec2.distance(target, hold.localPos);
+                if (dist < hold.magnetRadius && dist >= hold.adsorbRadius && dist < bestDist) {
+                    bestDist = dist;
+                    bestHold = hold;
+                }
+            }
+        }
+        return bestHold ? { hold: bestHold, dist: bestDist } : null;
     }
 
     public setStarted(v: boolean) {
