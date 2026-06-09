@@ -148,12 +148,10 @@
       "__id__": 7
     },
     "type": 3,
-    "isStartHold": false,
-    "isFinishHold": false,
     "adsorbRadius": 40,
     "releaseRadius": 60,
     "cooldownTime": 2,
-    "volumeMargin": 10,
+    "volumeMargin": 5,
     "forceAngleDown": 45,
     "forceAngleUp": 45,
     "allowFootStand": true,
@@ -165,6 +163,8 @@
       "b": 0,
       "a": 200
     },
+    "isStartPoint": false,
+    "isFinishPoint": false,
     "_id": ""
   },
   {

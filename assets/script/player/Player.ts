@@ -1,6 +1,8 @@
 import { _decorator, Component, Node, Graphics, Vec2, Color, UITransform } from 'cc';
-import { HoldManager } from './hold/HoldManager';
-import { HoldBase, HoldType } from './hold/HoldBase';
+import { HoldManager } from '../hold/HoldManager';
+import { HoldBase, HoldType } from '../hold/HoldBase';
+import { BoneChain } from './BoneChain';
+import { PlayerRenderer } from './PlayerRenderer';
 const { ccclass, property } = _decorator;
 
 export interface CharacterAppearance {
@@ -15,137 +17,6 @@ export interface CharacterAppearance {
 }
 
 export type BodyPart = 'leftHand' | 'rightHand' | 'leftFoot' | 'rightFoot' | 'torso';
-
-class BoneChain {
-    root: Vec2 = new Vec2();
-    mid: Vec2 = new Vec2();
-    end: Vec2 = new Vec2();
-    upperLen: number;
-    lowerLen: number;
-    target: Vec2 = new Vec2();
-    isLeft: boolean;
-    abductionPixels: number = 0;
-    preferVertical: boolean = false;
-    maxVerticalAngle: number = 0;
-    preferredSide: 'left' | 'right' | 'auto' = 'auto';
-    isArm: boolean = false;
-    desiredElbowUp: boolean | null = null; 
-
-    constructor(root: Vec2, mid: Vec2, end: Vec2, upperLen: number, lowerLen: number, isLeft: boolean) {
-        this.root.set(root);
-        this.mid.set(mid);
-        this.end.set(end);
-        this.upperLen = upperLen;
-        this.lowerLen = lowerLen;
-        this.isLeft = isLeft;
-        this.target.set(end);
-    }
-
-    solve(): boolean {
-        const root = this.root;
-        const target = this.target;
-        const upper = this.upperLen;
-        const lower = this.lowerLen;
-
-        const dx = target.x - root.x;
-        const dy = target.y - root.y;
-        let dist = Math.sqrt(dx * dx + dy * dy);
-        const maxDist = upper + lower;
-        const minDist = Math.abs(upper - lower);
-
-        if (dist >= maxDist - 1e-3) {
-            if (dist < 1e-3) return true;
-            const nx = dx / dist;
-            const ny = dy / dist;
-            this.mid.set(root.x + nx * upper, root.y + ny * upper);
-            this.end.set(root.x + nx * maxDist, root.y + ny * maxDist);
-            return false;
-        }
-
-        if (dist <= minDist + 1e-3) {
-            if (dist < 1e-3) return true;
-            const nx = dx / dist;
-            const ny = dy / dist;
-            this.mid.set(root.x + nx * upper, root.y + ny * upper);
-            this.end.set(root.x + nx * minDist, root.y + ny * minDist);
-            return false;
-        }
-
-        const nearStretch = 10.0;
-        if (dist >= maxDist - nearStretch) {
-            const nx = dx / dist;
-            const ny = dy / dist;
-            this.mid.set(root.x + nx * upper, root.y + ny * upper);
-            this.end.set(target.x, target.y);
-            return true;
-        }
-
-        const a = upper, b = lower, c = dist;
-        const cosInner = (a * a + b * b - c * c) / (2 * a * b);
-        const innerAngle = Math.acos(Math.max(-1, Math.min(1, cosInner)));
-        const baseDir = new Vec2(dx / dist, dy / dist);
-        const rotateRad = (Math.PI - innerAngle) / 2;
-
-        const candidates: Vec2[] = [];
-        for (const sign of [1, -1]) {
-            const rot = rotateRad * sign;
-            const upperDir = new Vec2(
-                baseDir.x * Math.cos(rot) - baseDir.y * Math.sin(rot),
-                baseDir.x * Math.sin(rot) + baseDir.y * Math.cos(rot)
-            );
-            const mid = new Vec2(root.x + upperDir.x * upper, root.y + upperDir.y * upper);
-            candidates.push(mid);
-        }
-
-        let chosenMid: Vec2;
-
-        // 侧身强制方向
-        if (this.preferredSide === 'left') {
-            chosenMid = candidates[0].x <= candidates[1].x ? candidates[0] : candidates[1];
-        } else if (this.preferredSide === 'right') {
-            chosenMid = candidates[0].x >= candidates[1].x ? candidates[0] : candidates[1];
-        }
-        // 自然方向
-        else {
-            if (this.isArm) {
-                const perpX = this.isLeft ? -dy : dy;
-                const perpY = this.isLeft ? dx : -dx;
-                let bestIdx = 0;
-                let bestDot = -Infinity;
-                for (let i = 0; i < 2; i++) {
-                    const mid = candidates[i];
-                    const midVecX = mid.x - root.x;
-                    const midVecY = mid.y - root.y;
-                    const dot = midVecX * perpX + midVecY * perpY;
-                    if (dot > bestDot) {
-                        bestDot = dot;
-                        bestIdx = i;
-                    }
-                }
-                chosenMid = candidates[bestIdx];
-            } else {
-                // 腿部原有逻辑：左膝向左，右膝向右
-                if (this.isLeft) {
-                    chosenMid = candidates[0].x < candidates[1].x ? candidates[0] : candidates[1];
-                } else {
-                    chosenMid = candidates[0].x > candidates[1].x ? candidates[0] : candidates[1];
-                }
-            }
-        }
-
-        this.mid.set(chosenMid);
-
-        const forearmDir = new Vec2(target.x - this.mid.x, target.y - this.mid.y);
-        const forearmDist = forearmDir.length();
-        if (forearmDist > 0.001) {
-            forearmDir.normalize();
-            this.end.set(this.mid.x + forearmDir.x * lower, this.mid.y + forearmDir.y * lower);
-        } else {
-            this.end.set(target);
-        }
-        return true;
-    }
-}
 
 @ccclass('Player')
 export class Player extends Component {
@@ -258,101 +129,7 @@ export class Player extends Component {
     };
 
     start() {
-        const s = this.scaleFactor;
-
-        // 1. 计算初始关节位置（未考虑地面）
-        this.initPose();
-
-        // 2. 计算四肢自然垂落/分开的目标位置（基于当前肩髋位置）
-        const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2 * s;
-        const hipHalfW = this.appearance.torsoWidth * 0.35 * s;
-
-        // 手臂总长
-        const totalArmLen = (this.upperArmLen + this.forearmLen) * s;
-        // 手臂与竖直方向夹角 30°（向外）
-        const armAngle = 30 * Math.PI / 180;
-        const armDx = Math.sin(armAngle) * totalArmLen;
-        const armDy = Math.cos(armAngle) * totalArmLen;  // 向下
-
-        const leftHandTarget = new Vec2(
-            this.leftShoulder.x - armDx,
-            this.leftShoulder.y - armDy
-        );
-        const rightHandTarget = new Vec2(
-            this.rightShoulder.x + armDx,
-            this.rightShoulder.y - armDy
-        );
-
-        // 腿总长
-        const totalLegLen = (this.upperLegLen + this.lowerLegLen) * s;
-        // 腿与竖直方向夹角 30°（向外），双脚呈 60°
-        const legAngle = 30 * Math.PI / 180;
-        const legDx = Math.sin(legAngle) * totalLegLen;
-        const legDy = Math.cos(legAngle) * totalLegLen;
-
-        const leftHipX = -hipHalfW;
-        const rightHipX = hipHalfW;
-        const leftFootTarget = new Vec2(
-            this.hip.x + leftHipX - legDx,
-            this.hip.y - legDy
-        );
-        const rightFootTarget = new Vec2(
-            this.hip.x + rightHipX + legDx,
-            this.hip.y - legDy
-        );
-
-        // 3. 自然脚底最低点
-        const naturalFootY = Math.min(leftFootTarget.y, rightFootTarget.y);
-
-        // 4. 地平线位置（基于 GameLayer 高度）
-        let targetGroundY = -800 * s; // fallback
-        if (this.gameLayer) {
-            const uiTransform = this.gameLayer.getComponent('cc.UITransform') as any;
-            if (uiTransform) {
-                const height = uiTransform.height;
-                const margin = 50 * s;
-                targetGroundY = -height / 2 + margin;
-            }
-        }
-        this.groundY = targetGroundY;
-
-        // 5. 整体垂直平移，使脚底对齐地平线
-        const deltaY = targetGroundY - naturalFootY;
-        this.shoulder.y += deltaY;
-        this.hip.y += deltaY;
-        this.head.y += deltaY;
-        this.leftShoulder.y += deltaY;
-        this.rightShoulder.y += deltaY;
-
-        leftHandTarget.y += deltaY;
-        rightHandTarget.y += deltaY;
-        leftFootTarget.y += deltaY;
-        rightFootTarget.y += deltaY;
-
-        // 6. 根据出生点节点调整角色水平位置
-        let deltaX = 0;
-        if (this.spawnPoint) {
-            const spawnX = this.spawnPoint.position.x;  // 假设在同一父节点下
-            const currentCenterX = (this.leftShoulder.x + this.rightShoulder.x) / 2; // 以肩中心为准
-            deltaX = spawnX - currentCenterX;
-        }
-
-        this.shoulder.x += deltaX;
-        this.hip.x += deltaX;
-        this.head.x += deltaX;
-        this.leftShoulder.x += deltaX;
-        this.rightShoulder.x += deltaX;
-
-        leftHandTarget.x += deltaX;
-        rightHandTarget.x += deltaX;
-        leftFootTarget.x += deltaX;
-        rightFootTarget.x += deltaX;
-
-        // 7. 保存初始髋部高度
-        this.initialHipY = this.hip.y;
-
-        // 8. 使用平移后的坐标初始化骨链
-        this.initBoneChains(leftHandTarget, rightHandTarget, leftFootTarget, rightFootTarget);
+        this.computeAndApplyInitialPose();
 
         // 确保 HoldManager 在开始时处于未起步状态
         if (this.holdManager) {
@@ -418,6 +195,42 @@ export class Player extends Component {
         return canReach;
     }
 
+    /**
+     * 检查改变 torsoLean 后，另一只锁定的脚是否仍能到达其目标。
+     * 如果不能，则不允许本次躯干旋转。
+     */
+    private canOtherLockedLegReachAfterLean(newLean: number, requestingPart: BodyPart): boolean {
+        const otherPart: BodyPart = requestingPart === 'leftFoot' ? 'rightFoot' : 'leftFoot';
+        const otherHold = this.adsorbedHold.get(otherPart);
+        if (!otherHold) return true; // 另一只脚没锁定，无限制
+
+        const otherChain = this.getChainByPart(otherPart);
+        if (!otherChain) return true;
+
+        // 保存当前状态
+        const oldLean = this.torsoLean;
+        const oldLeftRoot = this.leftLeg.root.clone();
+        const oldRightRoot = this.rightLeg.root.clone();
+
+        // 临时应用新的 torsoLean
+        this.torsoLean = newLean;
+        this.updateShoulderPositions();
+        // 更新腿部 root（torsoLean 变化不影响髋部位置，但 updateShoulderPositions 不更新腿 root）
+        const hipHalfW = this.appearance.torsoWidth * 0.35 * this.scaleFactor;
+        this.leftLeg.root.set(this.hip.x - hipHalfW, this.hip.y);
+        this.rightLeg.root.set(this.hip.x + hipHalfW, this.hip.y);
+
+        const canReach = this.canRootReachCurrentTarget(otherChain, otherPart);
+
+        // 恢复原状态
+        this.torsoLean = oldLean;
+        this.leftLeg.root.set(oldLeftRoot);
+        this.rightLeg.root.set(oldRightRoot);
+        this.updateShoulderPositions();
+
+        return canReach;
+    }
+
     private tryAdjustTorsoForReach(chain: BoneChain, desiredX: number, desiredY: number): boolean {
         const root = chain.root;
         const dx = desiredX - root.x;
@@ -442,43 +255,52 @@ export class Player extends Component {
             return newDist <= maxDist + 1e-3 && Math.abs(this.torsoLean - oldLean) > 0.5;
         }
 
+        // 腿部超出可达范围：沿 X 方向微调肩部位置（躯干侧倾辅助），不移动整个身体
         const shiftX = dx / dist * Math.min(dist * this.torsoAssistFactor * 0.25, this.maxTorsoLean * 0.5);
-        this.moveBodyByDelta(shiftX, 0);
+        const oldLean = this.torsoLean;
+        const newLean = this.clampTorsoLean(this.torsoLean + shiftX);
+
+        // 检查另一只锁定的腿是否能承受这次躯干旋转
+        if (!this.canOtherLockedLegReachAfterLean(newLean, this.activePart)) {
+            return false;
+        }
+
+        this.torsoLean = newLean;
+        this.updateShoulderPositions();
         const newDist = Vec2.distance(chain.root, new Vec2(desiredX, desiredY));
-        return newDist <= maxDist + 1e-3;
+        return newDist <= maxDist + 1e-3 && Math.abs(this.torsoLean - oldLean) > 0.5;
     }
 
     resetToInitialPose() {
-        const s = this.scaleFactor;
-
-        // 1. 恢复基础关节位置
-        this.initPose();
-
-        // 2. 重置吸附与拖拽状态
+        // 重置吸附与拖拽状态
         this.adsorbedHold.clear();
         this.timeoutReleasedHold.clear();
         this.dragOffset.set(0, 0);
         this.activePart = 'torso';
+        this.imbalanceTimer = 0;
+
+        this.computeAndApplyInitialPose();
+
         if (this.holdManager) {
             this.holdManager.setStarted(false);
             this.holdManager.setFinished(false);
         }
+    }
 
-        // 3. 计算地平线位置（与 start 中一致）
-        let targetGroundY = -800 * s;
-        if (this.gameLayer) {
-            const uiTransform = this.gameLayer.getComponent('cc.UITransform') as any;
-            if (uiTransform) {
-                const height = uiTransform.height;
-                const margin = 50 * s;
-                targetGroundY = -height / 2 + margin;
-            }
-        }
-        this.groundY = targetGroundY;
+    /**
+     * 计算并应用初始姿态：基础关节 → 四肢自然垂落目标 → 地面/出生点对齐 → 骨链初始化。
+     * 由 start() 和 resetToInitialPose() 共用。
+     */
+    private computeAndApplyInitialPose() {
+        const s = this.scaleFactor;
 
-        // 4. 计算四肢自然姿态的目标位置（双脚60°，手臂自然垂落30°）
+        // 1. 基础关节位置（torsoLean=0，肩/髋/头回原位）
+        this.initPose();
+
+        // 2. 计算四肢自然垂落/分开的目标位置（手臂30°向外，双腿60°分开）
         const shoulderHalfW = this.appearance.torsoWidth * 0.9 / 2 * s;
         const hipHalfW = this.appearance.torsoWidth * 0.35 * s;
+
         const totalArmLen = (this.upperArmLen + this.forearmLen) * s;
         const armAngle = 30 * Math.PI / 180;
         const armDx = Math.sin(armAngle) * totalArmLen;
@@ -491,17 +313,25 @@ export class Player extends Component {
         const legAngle = 30 * Math.PI / 180;
         const legDx = Math.sin(legAngle) * totalLegLen;
         const legDy = Math.cos(legAngle) * totalLegLen;
-        const leftHipX = -hipHalfW;
-        const rightHipX = hipHalfW;
 
-        const leftFootTarget = new Vec2(this.hip.x + leftHipX - legDx, this.hip.y - legDy);
-        const rightFootTarget = new Vec2(this.hip.x + rightHipX + legDx, this.hip.y - legDy);
+        const leftFootTarget = new Vec2(this.hip.x - hipHalfW - legDx, this.hip.y - legDy);
+        const rightFootTarget = new Vec2(this.hip.x + hipHalfW + legDx, this.hip.y - legDy);
 
-        // 5. 根据自然脚底位置与地平线对齐，计算垂直偏移
+        // 3. 地平线位置（基于 GameLayer 高度）
+        let targetGroundY = -800 * s; // fallback
+        if (this.gameLayer) {
+            const uiTransform = this.gameLayer.getComponent('cc.UITransform') as any;
+            if (uiTransform) {
+                const height = uiTransform.height;
+                const margin = 50 * s;
+                targetGroundY = -height / 2 + margin;
+            }
+        }
+        this.groundY = targetGroundY;
+
+        // 4. 整体垂直平移，使脚底对齐地平线
         const naturalFootY = Math.min(leftFootTarget.y, rightFootTarget.y);
         const deltaY = targetGroundY - naturalFootY;
-
-        // 6. 平移所有身体关键点及目标
         this.shoulder.y += deltaY;
         this.hip.y += deltaY;
         this.head.y += deltaY;
@@ -512,7 +342,7 @@ export class Player extends Component {
         leftFootTarget.y += deltaY;
         rightFootTarget.y += deltaY;
 
-        // 7. 根据出生点调整水平位置
+        // 5. 根据出生点节点调整角色水平位置
         if (this.spawnPoint) {
             const spawnX = this.spawnPoint.position.x;
             const currentCenterX = (this.leftShoulder.x + this.rightShoulder.x) / 2;
@@ -528,10 +358,10 @@ export class Player extends Component {
             rightFootTarget.x += deltaX;
         }
 
-        // 8. 更新初始髋部高度
+        // 6. 保存初始髋部高度
         this.initialHipY = this.hip.y;
 
-        // 9. 重新创建骨链（或更新目标）
+        // 7. 使用平移后的坐标初始化骨链
         this.initBoneChains(leftHandTarget, rightHandTarget, leftFootTarget, rightFootTarget);
     }
 
@@ -789,6 +619,9 @@ export class Player extends Component {
                 const oldX = chain.target.x, oldY = chain.target.y;
                 const newTargetX = chain.target.x + dx;
                 const newTargetY = chain.target.y + dy;
+                // 保存玩家意图位置（裁剪前），用于 VOLUME 吸附检测
+                const intendedX = newTargetX;
+                const intendedY = newTargetY;
 
                 // 脚移动限制
                 if (this.activePart === 'leftFoot' || this.activePart === 'rightFoot') {
@@ -841,7 +674,11 @@ export class Player extends Component {
                     const timeoutHold = this.timeoutReleasedHold.get(this.activePart);
                     let nearest: HoldBase | null = null;
                     if (timeoutHold) {
-                        const adsorbPos = timeoutHold.getAdsorbedPosition(chain.target);
+                        // VOLUME 超时岩点：用意图位置检测
+                        const timeoutTarget = (timeoutHold.type === HoldType.VOLUME && chain.isArm)
+                            ? new Vec2(intendedX, intendedY)
+                            : chain.target;
+                        const adsorbPos = timeoutHold.getAdsorbedPosition(timeoutTarget);
                         if (adsorbPos) {
                             nearest = timeoutHold;
                         } else {
@@ -852,26 +689,47 @@ export class Player extends Component {
 
                     // 如果没有超时脱落岩点可吸附，走正常吸附流程（排除冷却中的岩点）
                     if (!nearest) {
-                        nearest = this.holdManager.findNearestHold(chain.target, true);
+                        // VOLUME 吸附：用玩家意图位置（裁剪前）检测，避免裁剪后位置偏离线段
+                        const searchTarget = chain.isArm ? new Vec2(intendedX, intendedY) : chain.target;
+                        nearest = this.holdManager.findNearestHold(searchTarget, true);
                     }
 
                     if (nearest) {
-                        const adsorbPos = nearest.getAdsorbedPosition(chain.target);
+                        // VOLUME 吸附：用玩家意图位置（裁剪前）计算吸附点，避免裁剪后投影偏移
+                        const adsorbTarget = (nearest.type === HoldType.VOLUME && chain.isArm)
+                            ? new Vec2(intendedX, intendedY)
+                            : chain.target;
+                        const adsorbPos = nearest.getAdsorbedPosition(adsorbTarget);
                         if (adsorbPos) {
-                            chain.target.set(adsorbPos);
-                            this.adsorbedHold.set(this.activePart, nearest);
-                            this.dragOffset.set(0, 0);
-                            this.lastAdsorbTime = Date.now();
-                            this.forceAngleTimer.delete(this.activePart);
-                            // ★ 成功重新吸附后清除超时脱落记录
-                            this.timeoutReleasedHold.delete(this.activePart);
-                            if (chain.isArm && nearest.type !== HoldType.VOLUME) {
-                                chain.preferVertical = true;
-                                chain.maxVerticalAngle = 15;
+                            // VOLUME 吸附：意图投影点必须在臂长可达范围内，否则拒绝吸附
+                            if (nearest.type === HoldType.VOLUME && chain.isArm) {
+                                const maxLen = chain.upperLen + chain.lowerLen;
+                                const distToAdsorb = Vec2.distance(chain.root, adsorbPos);
+                                if (distToAdsorb <= maxLen) {
+                                    chain.target.set(adsorbPos);
+                                    this.adsorbedHold.set(this.activePart, nearest);
+                                    this.dragOffset.set(0, 0);
+                                    this.lastAdsorbTime = Date.now();
+                                    this.forceAngleTimer.delete(this.activePart);
+                                    this.timeoutReleasedHold.delete(this.activePart);
+                                    this.checkStartCondition();
+                                    this.checkFinishCondition();
+                                }
+                                // 意图投影点不可达 → 拒绝吸附，玩家需先移动身体靠近
+                            } else {
+                                chain.target.set(adsorbPos);
+                                this.adsorbedHold.set(this.activePart, nearest);
+                                this.dragOffset.set(0, 0);
+                                this.lastAdsorbTime = Date.now();
+                                this.forceAngleTimer.delete(this.activePart);
+                                this.timeoutReleasedHold.delete(this.activePart);
+                                if (chain.isArm && nearest.type !== HoldType.VOLUME) {
+                                    chain.preferVertical = true;
+                                    chain.maxVerticalAngle = 15;
+                                }
+                                this.checkStartCondition();
+                                this.checkFinishCondition();
                             }
-                            // 在每次成功吸附后，检查是否满足起步或结束条件
-                            this.checkStartCondition();
-                            this.checkFinishCondition();
                         }
                     }
                 }
@@ -892,44 +750,7 @@ export class Player extends Component {
                 let newX = this.hip.x + dx * 0.6;
                 let newY = this.hip.y + dy;
 
-                let valid = this.clampHipToAdsorbedLegs(newX, newY);
-                valid = this.clampHipToAdsorbedArms(valid.x, valid.y);
-
-                // ★ 需求1：没有任何锁定点时，脚站在地面上不能离开地面
-                // 通过约束髋部位置来确保脚不离开地面
-                if (this.hasNoLockedHolds()) {
-                    valid = this.clampHipToGroundFeet(valid.x, valid.y);
-                }
-
-                // 髋部连线距离限制
-                const footA = this.leftLeg.target;
-                const footB = this.rightLeg.target;
-                const fdx = footB.x - footA.x;
-                const fdy = footB.y - footA.y;
-                const lenSq = fdx * fdx + fdy * fdy;
-                if (lenSq < 0.001) {
-                    if (valid.y < footA.y + this.minHipToFeetLineDist) {
-                        const angle = Math.atan2(valid.y - footA.y, valid.x - footA.x);
-                        valid.x = footA.x + Math.cos(angle) * this.minHipToFeetLineDist;
-                        valid.y = footA.y + Math.sin(angle) * this.minHipToFeetLineDist;
-                    }
-                } else {
-                    const len = Math.sqrt(lenSq);
-                    const nx = -fdy / len;
-                    const ny = fdx / len;
-                    const signedDist = (valid.x - footA.x) * nx + (valid.y - footA.y) * ny;
-                    if (signedDist < this.minHipToFeetLineDist) {
-                        const moveAmount = this.minHipToFeetLineDist - signedDist;
-                        valid.x += nx * moveAmount;
-                        valid.y += ny * moveAmount;
-                    }
-                }
-
-                // 脚高度约束（髋部必须高于最高脚 + footHipOffset）
-                const maxFootY = Math.max(this.leftLeg.target.y, this.rightLeg.target.y);
-                if (valid.y < maxFootY + this.footHipOffset) {
-                    valid.y = maxFootY + this.footHipOffset;
-                }
+                const valid = this.clampHipPosition(newX, newY);
 
                 const delta = new Vec2(valid.x - this.hip.x, valid.y - this.hip.y);
                 if (delta.x === 0 && delta.y === 0) return false;
@@ -1090,53 +911,7 @@ export class Player extends Component {
         let newX = this.hip.x + dx * 0.6;
         let newY = this.hip.y + dy;
 
-        let valid = this.clampHipToAdsorbedLegs(newX, newY);
-        valid = this.clampHipToAdsorbedArms(valid.x, valid.y);
-
-        // ★ 需求1：没有任何锁定点时，脚站在地面上不能离开地面
-        if (this.hasNoLockedHolds()) {
-            valid = this.clampHipToGroundFeet(valid.x, valid.y);
-        }
-
-        // 髋部连线距离限制（与 torso 保持一致）
-        const applyHipConstraint = (x: number, y: number): Vec2 => {
-            const footA = this.leftLeg.target;
-            const footB = this.rightLeg.target;
-            const fdx = footB.x - footA.x;
-            const fdy = footB.y - footA.y;
-            const lenSq = fdx * fdx + fdy * fdy;
-            if (lenSq < 0.001) {
-                if (y < footA.y + this.minHipToFeetLineDist) {
-                    const angle = Math.atan2(y - footA.y, x - footA.x);
-                    return new Vec2(
-                        footA.x + Math.cos(angle) * this.minHipToFeetLineDist,
-                        footA.y + Math.sin(angle) * this.minHipToFeetLineDist
-                    );
-                }
-            } else {
-                const len = Math.sqrt(lenSq);
-                // 法向量 nx = -fdy/len, ny = fdx/len（指向 footA→footB 的左侧）
-                // signedDist = (x-footA.x)*nx + (y-footA.y)*ny，正值表示髋部在连线左侧（上方）
-                const signedDist = (-(x - footA.x) * fdy + (y - footA.y) * fdx) / len;
-                if (signedDist < this.minHipToFeetLineDist) {
-                    const nx = -fdy / len;
-                    const ny = fdx / len;
-                    const moveAmount = this.minHipToFeetLineDist - signedDist;
-                    return new Vec2(x + nx * moveAmount, y + ny * moveAmount);
-                }
-            }
-            return new Vec2(x, y);
-        };
-
-        const constrained = applyHipConstraint(valid.x, valid.y);
-        valid.x = constrained.x;
-        valid.y = constrained.y;
-
-        // 新增：髋部必须高于最高脚 + footHipOffset
-        const maxFootY = Math.max(this.leftLeg.target.y, this.rightLeg.target.y);
-        if (valid.y < maxFootY + this.footHipOffset) {
-            valid.y = maxFootY + this.footHipOffset;
-        }
+        const valid = this.clampHipPosition(newX, newY);
 
         const delta = new Vec2(valid.x - this.hip.x, valid.y - this.hip.y);
         if (delta.x === 0 && delta.y === 0) return;
@@ -1196,8 +971,13 @@ export class Player extends Component {
         this.updateKneeAbduction();
         this.updateArmAbduction();
         for (const { chain } of limbs) chain.solve();
-        if (reduceTorsoLean) {
-            this.tryReduceTorsoLean();
+        if (reduceTorsoLean && this.tryReduceTorsoLean()) {
+            // torsoLean 回正导致手臂 root 移动，将未锁定手臂的 target 同步到当前 end
+            for (const { chain, part } of limbs) {
+                if (!this.adsorbedHold.has(part) && chain.isArm) {
+                    chain.target.set(chain.end);
+                }
+            }
         }
     }
 
@@ -1289,6 +1069,50 @@ export class Player extends Component {
     }
 
     /**
+     * 综合髋部位置约束：依次应用腿部吸附、手臂吸附、地面脚、髋部连线、脚高度约束。
+     */
+    private clampHipPosition(hipX: number, hipY: number): Vec2 {
+        let valid = this.clampHipToAdsorbedLegs(hipX, hipY);
+        valid = this.clampHipToAdsorbedArms(valid.x, valid.y);
+
+        if (this.hasNoLockedHolds()) {
+            valid = this.clampHipToGroundFeet(valid.x, valid.y);
+        }
+
+        // 髋部连线距离限制
+        const footA = this.leftLeg.target;
+        const footB = this.rightLeg.target;
+        const fdx = footB.x - footA.x;
+        const fdy = footB.y - footA.y;
+        const lenSq = fdx * fdx + fdy * fdy;
+        if (lenSq < 0.001) {
+            if (valid.y < footA.y + this.minHipToFeetLineDist) {
+                const angle = Math.atan2(valid.y - footA.y, valid.x - footA.x);
+                valid.x = footA.x + Math.cos(angle) * this.minHipToFeetLineDist;
+                valid.y = footA.y + Math.sin(angle) * this.minHipToFeetLineDist;
+            }
+        } else {
+            const len = Math.sqrt(lenSq);
+            const nx = -fdy / len;
+            const ny = fdx / len;
+            const signedDist = (valid.x - footA.x) * nx + (valid.y - footA.y) * ny;
+            if (signedDist < this.minHipToFeetLineDist) {
+                const moveAmount = this.minHipToFeetLineDist - signedDist;
+                valid.x += nx * moveAmount;
+                valid.y += ny * moveAmount;
+            }
+        }
+
+        // 髋部必须高于最高脚 + footHipOffset
+        const maxFootY = Math.max(this.leftLeg.target.y, this.rightLeg.target.y);
+        if (valid.y < maxFootY + this.footHipOffset) {
+            valid.y = maxFootY + this.footHipOffset;
+        }
+
+        return valid;
+    }
+
+    /**
      * ★ 确保脚在地面上的目标点在腿长可达范围内。
      * 脚Y已锁定在groundY，如果髋部到该点的距离超过腿长，沿X方向将脚拉近。
      */
@@ -1346,23 +1170,21 @@ export class Player extends Component {
                 const hold = this.adsorbedHold.get(part)!;
                 const maxLen = leg.upperLen + leg.lowerLen;
 
-                let targetX: number, targetY: number;
-                // ★ 修改：脚锁定在 Volume 上时，直接使用脚当前的目标位置（固定点）
-                if (hold.type === HoldType.VOLUME) {
-                    // 脚不滑动，使用当前目标（吸附点）
-                    targetX = leg.target.x - hipDx;
-                    targetY = leg.target.y;
-                } else {
-                    targetX = leg.target.x - hipDx;
-                    targetY = leg.target.y;
-                }
+                // 脚锁定在岩点上，计算髋部连接点到脚目标的距离
+                const rootX = hipX + hipDx;
+                const rootY = hipY;
+                const targetX = leg.target.x;
+                const targetY = leg.target.y;
 
-                const dx = hipX - targetX;
-                const dy = hipY - targetY;
+                const dx = rootX - targetX;
+                const dy = rootY - targetY;
                 const dist = Math.sqrt(dx * dx + dy * dy);
                 if (dist > maxLen) {
-                    hipX = targetX + (dx / dist) * maxLen;
-                    hipY = targetY + (dy / dist) * maxLen;
+                    // 约束髋部连接点，使腿能到达脚目标
+                    const constrainedRootX = targetX + (dx / dist) * maxLen;
+                    const constrainedRootY = targetY + (dy / dist) * maxLen;
+                    hipX = constrainedRootX - hipDx;
+                    hipY = constrainedRootY;
                 }
             }
         }
@@ -1401,96 +1223,10 @@ export class Player extends Component {
             }
         }
     }
-    
-    private drawForceSector(gfx: Graphics, center: Vec2, radius: number, centerDir: Vec2, angleDown: number, angleUp: number, color: Color) {
-        if (angleDown <= 0 && angleUp <= 0) return;
-
-        const baseAngle = Math.atan2(centerDir.y, centerDir.x);
-        const startAngle = baseAngle - angleUp * Math.PI / 180;
-        const endAngle = baseAngle + angleDown * Math.PI / 180;
-        const totalAngle = endAngle - startAngle;
-
-        if (totalAngle <= 0) return;
-
-        // 填充扇形
-        const fillColor = new Color(color.r, color.g, color.b, 50);
-        gfx.fillColor = fillColor;
-        gfx.moveTo(center.x, center.y);
-        const segments = 20;
-        for (let i = 0; i <= segments; i++) {
-            const a = startAngle + totalAngle * i / segments;
-            gfx.lineTo(center.x + Math.cos(a) * radius, center.y + Math.sin(a) * radius);
-        }
-        gfx.close();
-        gfx.fill();
-
-        // 描边
-        gfx.strokeColor = new Color(color.r, color.g, color.b, 180);
-        gfx.lineWidth = 3;
-        const leftDir = new Vec2(Math.cos(startAngle), Math.sin(startAngle));
-        const rightDir = new Vec2(Math.cos(endAngle), Math.sin(endAngle));
-        gfx.moveTo(center.x, center.y);
-        gfx.lineTo(center.x + leftDir.x * radius, center.y + leftDir.y * radius);
-        gfx.stroke();
-        gfx.moveTo(center.x, center.y);
-        gfx.lineTo(center.x + rightDir.x * radius, center.y + rightDir.y * radius);
-        gfx.stroke();
-
-        // 弧线
-        let prevX = center.x + Math.cos(startAngle) * radius;
-        let prevY = center.y + Math.sin(startAngle) * radius;
-        for (let i = 1; i <= segments; i++) {
-            const a = startAngle + totalAngle * i / segments;
-            const nx = center.x + Math.cos(a) * radius;
-            const ny = center.y + Math.sin(a) * radius;
-            gfx.moveTo(prevX, prevY);
-            gfx.lineTo(nx, ny);
-            gfx.stroke();
-            prevX = nx;
-            prevY = ny;
-        }
-    }
-
-    private getSupportPoints(): Vec2[] {
-        const points: Vec2[] = [];
-
-        // 左脚支撑：吸附在岩点上 或 站在地面上
-        if (this.adsorbedHold.has('leftFoot')) {
-            const hold = this.adsorbedHold.get('leftFoot')!;
-            if (hold.allowFootStand) {
-                points.push(this.leftLeg.target.clone());
-            }
-        } else if (Math.abs(this.leftLeg.target.y - this.groundY) < this.groundStandTolerance) {
-            // 脚在地面上也算支撑点
-            points.push(this.leftLeg.target.clone());
-        }
-
-        // 右脚支撑：吸附在岩点上 或 站在地面上
-        if (this.adsorbedHold.has('rightFoot')) {
-            const hold = this.adsorbedHold.get('rightFoot')!;
-            if (hold.allowFootStand) {
-                points.push(this.rightLeg.target.clone());
-            }
-        } else if (Math.abs(this.rightLeg.target.y - this.groundY) < this.groundStandTolerance) {
-            // 脚在地面上也算支撑点
-            points.push(this.rightLeg.target.clone());
-        }
-
-        // 手部支撑（锁定且受力良好）
-        for (const part of ['leftHand', 'rightHand'] as BodyPart[]) {
-            if (this.adsorbedHold.has(part) && this.isPartUnderForce(part)) {
-                points.push(this.getChainByPart(part)!.target.clone());
-            }
-        }
-
-        return points;
-    }
 
     private onFall() {
         console.warn("失衡掉落！");
         this.resetToInitialPose();
-        this.adsorbedHold.clear();
-        this.imbalanceTimer = 0;
     }
 
     private checkBalance(dt: number) {
@@ -1502,31 +1238,6 @@ export class Player extends Component {
         } else {
             this.imbalanceTimer = 0;
         }
-    }
-
-    /**
-     * 射线法判断点是否在多边形内（2D）
-     */
-    private isPointInPolygon(point: Vec2, polygon: Vec2[]): boolean {
-        const n = polygon.length;
-        if (n === 0) return false;
-        if (n === 1) return Vec2.distance(point, polygon[0]) < this.footWidth;
-        if (n === 2) {
-            const minX = Math.min(polygon[0].x, polygon[1].x);
-            const maxX = Math.max(polygon[0].x, polygon[1].x);
-            return point.x >= minX && point.x <= maxX;
-        }
-
-        let inside = false;
-        for (let i = 0, j = n - 1; i < n; j = i++) {
-            const xi = polygon[i].x, yi = polygon[i].y;
-            const xj = polygon[j].x, yj = polygon[j].y;
-            if ((yi > point.y) !== (yj > point.y) &&
-                point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi) {
-                inside = !inside;
-            }
-        }
-        return inside;
     }
 
     private clampHipToAdsorbedArms(hipX: number, hipY: number): Vec2 {
@@ -1578,16 +1289,15 @@ export class Player extends Component {
                         // 如果 minDistToVolume <= maxLen，肩膀能到达 Volume，不约束
                     }
                 } else {
-                    // 点吸附：使用固定岩点位置约束
-                    const targetX = arm.target.x - shoulderDx;
-                    const targetY = arm.target.y - shoulderOffsetY;
-
-                    const dx = hipX - targetX;
-                    const dy = hipY - targetY;
+                    // 点吸附：基于肩膀实际位置约束髋部
+                    const dx = shoulderPos.x - arm.target.x;
+                    const dy = shoulderPos.y - arm.target.y;
                     const dist = Math.sqrt(dx * dx + dy * dy);
                     if (dist > maxLen) {
-                        hipX = targetX + (dx / dist) * maxLen;
-                        hipY = targetY + (dy / dist) * maxLen;
+                        const constrainedShoulderX = arm.target.x + (dx / dist) * maxLen;
+                        const constrainedShoulderY = arm.target.y + (dy / dist) * maxLen;
+                        hipX = constrainedShoulderX - this.torsoLean - shoulderDx;
+                        hipY = constrainedShoulderY - shoulderOffsetY;
                     }
                 }
             }
@@ -1600,7 +1310,7 @@ export class Player extends Component {
         this.shoulder.y += deltaY;
         this.head.x += deltaX; this.head.y += deltaY;
         this.updateShoulderPositions();
-        const hipHalfW = this.appearance.torsoWidth * 0.35;
+        const hipHalfW = this.appearance.torsoWidth * 0.35 * this.scaleFactor;
         this.leftLeg.root.set(this.hip.x - hipHalfW, this.hip.y);
         this.rightLeg.root.set(this.hip.x + hipHalfW, this.hip.y);
     }
@@ -1788,15 +1498,11 @@ export class Player extends Component {
 
 
     private updateKneeAbduction() {
-        this.leftLeg.preferredSide = 'auto';
-        this.rightLeg.preferredSide = 'auto';
+        // 预留：未来可根据游戏状态调整膝关节方向偏好
     }
 
     private updateArmAbduction() {
-        this.leftArm.abductionPixels = 0;
-        this.rightArm.abductionPixels = 0;
-        this.leftArm.preferredSide = 'auto';
-        this.rightArm.preferredSide = 'auto';
+        // 预留：未来可根据游戏状态调整手臂外展方向偏好
     }
 
     update(dt: number) {
@@ -1834,263 +1540,38 @@ export class Player extends Component {
     drawCharacter() {
         const gfx = this.node.getComponent(Graphics);
         if (!gfx) return;
-        gfx.clear();
 
-        const s = this.scaleFactor;
-        const app = this.appearance;
-        const limbW = app.limbWidth * s;
-        const jointR = app.jointRadius * s;
-        const headR = app.headRadius * s;
-        const torsoW = app.torsoWidth * s;
-        const torsoH = app.torsoHeight * s;
-
-        // 脊柱
-        const spineTop = this.shoulder.y + 5 * s;
-        const spineBottom = this.hip.y - 5 * s;
-        for (let i = 0; i < 5; i++) {
-            const t = i / 4, y = spineTop + (spineBottom - spineTop) * t;
-            gfx.fillColor = new Color(255, 255, 255, 80);
-            gfx.circle(this.shoulder.x, y, 2 * s); gfx.fill();
-        }
-
-        // 躯干
-        gfx.fillColor = app.clothColor;
-        const leftHip = new Vec2(this.hip.x - app.torsoWidth * 0.35 * s, this.hip.y);
-        const rightHip = new Vec2(this.hip.x + app.torsoWidth * 0.35 * s, this.hip.y);
-        gfx.moveTo(this.leftShoulder.x, this.leftShoulder.y + 5 * s);
-        gfx.lineTo(this.rightShoulder.x, this.rightShoulder.y + 5 * s);
-        gfx.lineTo(rightHip.x, rightHip.y - 5 * s);
-        gfx.lineTo(leftHip.x, leftHip.y - 5 * s);
-        gfx.close();
-        gfx.fill();
-
-        // 头
-        gfx.fillColor = app.hairColor;
-        gfx.circle(this.head.x, this.head.y + 2 * s, headR + 2 * s); gfx.fill();
-        gfx.fillColor = app.skinColor;
-        gfx.circle(this.head.x, this.head.y, headR); gfx.fill();
-        gfx.fillColor = new Color(255, 255, 255, 200);
-        gfx.circle(this.head.x - 4 * s, this.head.y + 4 * s, 4 * s); gfx.fill();
-
-        // 脖子
-        gfx.strokeColor = app.skinColor;
-        gfx.lineWidth = 8 * s; gfx.lineCap = Graphics.LineCap.ROUND;
-        gfx.moveTo(this.shoulder.x, this.shoulder.y + 15 * s);
-        gfx.lineTo(this.head.x, this.head.y - headR); gfx.stroke();
-
-        // 肩髋关节
-        gfx.fillColor = app.clothColor;
-        gfx.circle(this.leftShoulder.x, this.leftShoulder.y, 8 * s); gfx.fill();
-        gfx.circle(this.rightShoulder.x, this.rightShoulder.y, 8 * s); gfx.fill();
-        gfx.circle(leftHip.x, leftHip.y, 7 * s); gfx.fill();
-        gfx.circle(rightHip.x, rightHip.y, 7 * s); gfx.fill();
-
-        // 四肢（根据锁定和受力状态决定颜色）
-        const getLimbColor = (part: BodyPart): Color => {
-            if (this.adsorbedHold.has(part)) {
-                return this.isPartUnderForce(part) ? this.forceColor : this.noForceColor;
-            }
-            return app.skinColor;
-        };
-
-        gfx.lineWidth = limbW;
-        gfx.lineCap = Graphics.LineCap.ROUND;
-
-        gfx.strokeColor = getLimbColor('leftHand');
-        this.drawLimb(gfx, this.leftArm.root, this.leftArm.mid, this.leftArm.end);
-
-        gfx.strokeColor = getLimbColor('rightHand');
-        this.drawLimb(gfx, this.rightArm.root, this.rightArm.mid, this.rightArm.end);
-
-        gfx.strokeColor = getLimbColor('leftFoot');
-        this.drawLimb(gfx, this.leftLeg.root, this.leftLeg.mid, this.leftLeg.end);
-
-        gfx.strokeColor = getLimbColor('rightFoot');
-        this.drawLimb(gfx, this.rightLeg.root, this.rightLeg.mid, this.rightLeg.end);
-
-        // 关节
-        const jointColor = new Color(app.skinColor.r * 0.7, app.skinColor.g * 0.7, app.skinColor.b * 0.7, 255);
-        gfx.fillColor = jointColor;
-        gfx.circle(this.leftArm.mid.x, this.leftArm.mid.y, jointR); gfx.fill();
-        gfx.circle(this.rightArm.mid.x, this.rightArm.mid.y, jointR); gfx.fill();
-        gfx.circle(this.leftLeg.mid.x, this.leftLeg.mid.y, jointR); gfx.fill();
-        gfx.circle(this.rightLeg.mid.x, this.rightLeg.mid.y, jointR); gfx.fill();
-
-        // 手脚末端（用可配置的半径和颜色）
-        const handEndR = this.handEndRadius * s;
-        const footEndR = this.footEndRadius * s;
-
-        gfx.fillColor = this.handEndColor;
-        gfx.circle(this.leftArm.end.x, this.leftArm.end.y, handEndR); gfx.fill();
-        gfx.circle(this.rightArm.end.x, this.rightArm.end.y, handEndR); gfx.fill();
-
-        gfx.fillColor = this.footEndColor;
-        gfx.circle(this.leftLeg.end.x, this.leftLeg.end.y, footEndR); gfx.fill();
-        gfx.circle(this.rightLeg.end.x, this.rightLeg.end.y, footEndR); gfx.fill();
-
-        // 质心
-        const com = this.getCenterOfMass();
-        gfx.fillColor = new Color(255, 255, 0, 255);
-        gfx.circle(com.x, com.y, 8 * s); gfx.fill();
-
-        // 失衡警告：质心处红色闪烁
-        if (this.imbalanceTimer > 0) {
-            const warnAlpha = Math.abs(Math.sin(Date.now() * 0.01)) * 200 + 55;
-            gfx.fillColor = new Color(255, 0, 0, warnAlpha);
-            gfx.circle(com.x, com.y, 12 * s); // 比质心大一点
-            gfx.fill();
-            // 可选：绘制一个 X
-            gfx.strokeColor = new Color(255, 0, 0, 255);
-            gfx.lineWidth = 3 * s;
-            gfx.moveTo(com.x - 6 * s, com.y - 6 * s);
-            gfx.lineTo(com.x + 6 * s, com.y + 6 * s);
-            gfx.moveTo(com.x + 6 * s, com.y - 6 * s);
-            gfx.lineTo(com.x - 6 * s, com.y + 6 * s);
-            gfx.stroke();
-        }
-
-        // 地面线（保持原样，可选缩放）
-        gfx.strokeColor = new Color(180, 180, 180, 255);
-        gfx.lineWidth = 4 * s;
-
-        // 获取 GameLayer 宽度
-        let groundWidth = 700 * s; // 默认值
-        if (this.gameLayer) {
-            const uiTransform = this.gameLayer.getComponent('cc.UITransform') as any;
-            if (uiTransform) {
-                groundWidth = uiTransform.width;
-            }
-        }
-        const halfGround = groundWidth / 2;
-        gfx.moveTo(-halfGround, this.groundY);
-        gfx.lineTo(halfGround, this.groundY);
-        gfx.stroke();
-
-        // 选中高亮
-        let highlightPos: Vec2 | null = null;
-        switch (this.activePart) {
-            case 'leftHand': highlightPos = this.leftArm.end; break;
-            case 'rightHand': highlightPos = this.rightArm.end; break;
-            case 'leftFoot': highlightPos = this.leftLeg.end; break;
-            case 'rightFoot': highlightPos = this.rightLeg.end; break;
-            case 'torso': highlightPos = com; break;
-        }
-        if (highlightPos) {
-            gfx.strokeColor = new Color(255, 215, 0, 255);
-            gfx.lineWidth = 3 * s;
-            gfx.circle(highlightPos.x, highlightPos.y, 13 * s); gfx.stroke();
-        }
-
-        // ========== 绘制所有非 Volume 岩点的力方向扇形 ==========
-        // 绘制所有非 Volume 岩点的力方向扇形
-        if (this.holdManager) {
-            const allHolds = this.holdManager.getHolds();
-            for (const hold of allHolds) {
-                if (hold.type === HoldType.VOLUME) continue;
-                if (hold.forceAngleDown <= 0 && hold.forceAngleUp <= 0) continue; // 无角度限制不显示
-                const centerDir = hold.getWorldForceDirection(); // 向下方向
-                const center = hold.localPos;
-                const radius = hold.adsorbRadius * s * 1.5;
-                this.drawForceSector(gfx, center, radius, centerDir, hold.forceAngleDown, hold.forceAngleUp, hold.forceSectorColor);
-            }
-            // 额外：为 Volume 岩点绘制线段（调试用，便于观察坐标和方向）
-            for (const hold of allHolds) {
-                if (hold.type !== HoldType.VOLUME) continue;
-                const seg = hold.getVolumeLineSegment();
-                if (!seg) continue;
-                // 线段
-                gfx.lineWidth = 3 * s;
-                gfx.strokeColor = new Color(0, 120, 255, 200);
-                gfx.moveTo(seg.start.x, seg.start.y);
-                gfx.lineTo(seg.end.x, seg.end.y);
-                gfx.stroke();
-                // 端点标记
-                gfx.fillColor = new Color(0, 120, 255, 200);
-                gfx.circle(seg.start.x, seg.start.y, 6 * s); gfx.fill();
-                gfx.circle(seg.end.x, seg.end.y, 6 * s); gfx.fill();
-                // 中心点
-                const center = new Vec2((seg.start.x + seg.end.x) / 2, (seg.start.y + seg.end.y) / 2);
-                gfx.fillColor = new Color(0, 200, 120, 180);
-                gfx.circle(center.x, center.y, 5 * s); gfx.fill();
-            }
-        }
-
-        // 调试：在双脚位置画大红点
-        if (this.adsorbedHold.has('leftFoot')) {
-            gfx.fillColor = new Color(255, 0, 0, 255);
-            gfx.circle(this.leftLeg.target.x, this.leftLeg.target.y, 15 * s);
-            gfx.fill();
-        }
-        if (this.adsorbedHold.has('rightFoot')) {
-            gfx.fillColor = new Color(255, 0, 0, 255);
-            gfx.circle(this.rightLeg.target.x, this.rightLeg.target.y, 15 * s);
-            gfx.fill();
-        }
-
-        // ========== 绘制支撑区域 ==========
-        // 绘制支撑区域
-        const range = this.getSupportXRange();
-        if (range) {
-            let baseY = this.groundY;
-            if (this.adsorbedHold.has('leftFoot')) baseY = Math.max(baseY, this.leftLeg.target.y);
-            if (this.adsorbedHold.has('rightFoot')) baseY = Math.max(baseY, this.rightLeg.target.y);
-
-            const leftX = range.min;
-            const rightX = range.max;
-
-            gfx.strokeColor = this.supportPolygonColor;
-            gfx.lineWidth = 4 * s;
-            gfx.moveTo(leftX, baseY);
-            gfx.lineTo(rightX, baseY);
-            gfx.stroke();
-
-            // 绘制手支撑点标记
-            for (const part of ['leftHand', 'rightHand'] as BodyPart[]) {
-                if (this.adsorbedHold.has(part) && this.isPartUnderForce(part)) {
-                    const handX = this.getChainByPart(part)!.target.x;
-                    gfx.strokeColor = new Color(0, 100, 255, 200);
-                    gfx.lineWidth = 3 * s;
-                    gfx.moveTo(handX, baseY - 8 * s);
-                    gfx.lineTo(handX, baseY + 8 * s);
-                    gfx.stroke();
-                }
-            }
-
-            // 失衡警告闪烁（保持不变）
-            if (this.imbalanceTimer > 0) {
-                const warnAlpha = Math.abs(Math.sin(Date.now() * 0.01)) * 150 + 50;
-                gfx.fillColor = new Color(255, 0, 0, warnAlpha);
-                gfx.rect(leftX, baseY - 10 * s, rightX - leftX, 10 * s);
-                gfx.fill();
-                gfx.strokeColor = new Color(255, 0, 0, 255);
-                gfx.lineWidth = 6 * s;
-                gfx.moveTo(leftX, baseY);
-                gfx.lineTo(rightX, baseY);
-                gfx.stroke();
-            }
-        }
-
-        if (range) {
-            // 先画一条从左脚到右脚的粗红线，确保可见
-            gfx.strokeColor = new Color(255, 0, 0, 255);
-            gfx.lineWidth = 6 * s;
-            gfx.moveTo(range.min, this.leftLeg.target.y);
-            gfx.lineTo(range.max, this.rightLeg.target.y);
-            gfx.stroke();
-
-            // 再覆盖绘制绿色支撑线
-            gfx.strokeColor = this.supportPolygonColor; // 绿色半透明
-            gfx.lineWidth = 4 * s;
-            gfx.moveTo(range.min, Math.max(this.leftLeg.target.y, this.rightLeg.target.y));
-            gfx.lineTo(range.max, Math.max(this.leftLeg.target.y, this.rightLeg.target.y));
-            gfx.stroke();
-        }
+        PlayerRenderer.drawCharacter(
+            gfx,
+            this.scaleFactor,
+            this.appearance,
+            this.head,
+            this.shoulder,
+            this.hip,
+            this.leftShoulder,
+            this.rightShoulder,
+            this.leftArm,
+            this.rightArm,
+            this.leftLeg,
+            this.rightLeg,
+            this.activePart,
+            this.groundY,
+            this.handEndRadius,
+            this.footEndRadius,
+            this.handEndColor,
+            this.footEndColor,
+            this.forceColor,
+            this.noForceColor,
+            this.supportPolygonColor,
+            this.footWidth,
+            this.imbalanceTimer,
+            this.adsorbedHold,
+            this.isPartUnderForce.bind(this),
+            this.getCenterOfMass.bind(this),
+            this.getSupportXRange.bind(this),
+            this.holdManager,
+            this.gameLayer,
+        );
     }
 
-    private drawLimb(gfx: Graphics, from: Vec2, mid: Vec2, to: Vec2) {
-        gfx.moveTo(from.x, from.y);
-        gfx.lineTo(mid.x, mid.y);
-        gfx.lineTo(to.x, to.y);
-        gfx.stroke();
-    }
 }

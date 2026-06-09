@@ -1,5 +1,5 @@
 import { _decorator, Component, Button, Node, Vec2, Color, input, Input, EventKeyboard, KeyCode } from 'cc';
-import { Player, BodyPart } from '../Player';
+import { Player, BodyPart } from '../player/Player';
 import { Joystick } from './Joystick';
 
 const { ccclass, property } = _decorator;
