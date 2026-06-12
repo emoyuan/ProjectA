@@ -25,20 +25,9 @@ export class HoldBase extends Component {
     @property({ tooltip: 'Volume 吸附额外边距（扩大矩形）', visible() { return this.type === HoldType.VOLUME; } })
     volumeMargin: number = 10;
 
-    @property({ tooltip: '从中心方向（向下）向下扩展的角度（度）', visible() { return this.type !== HoldType.FOOTHOLD; } })
-    forceAngleDown: number = 45;
+    @property({ tooltip: '受力角度范围（度）：从中心向两边对称打开。例如90表示左右各45度', visible() { return this.type !== HoldType.FOOTHOLD; } })
+    forceAngleRange: number = 90;
 
-    @property({ tooltip: '从中心方向（向下）向上扩展的角度（度）', visible() { return this.type !== HoldType.FOOTHOLD; } })
-    forceAngleUp: number = 45;
-
-    // 脚的使用权限（会在 start 中根据 type 自动覆盖）
-    @property({ tooltip: '脚是否可以踩（站立/推力）' })
-    allowFootStand: boolean = true;
-
-    @property({ tooltip: '脚是否可以勾（钩挂/拉力）' })
-    allowFootHook: boolean = true;
-
-    // 在 forceAngleRange 属性下方添加
     @property({ type: Color, tooltip: '力方向扇形颜色', visible() { return this.type !== HoldType.FOOTHOLD; } })
     forceSectorColor: Color = new Color(255, 200, 0, 200);  // 黄色半透明
 
@@ -62,30 +51,19 @@ export class HoldBase extends Component {
         this.localPos.set(pos.x, pos.y);
     }
 
-    // 根据 type 设置 forceDirection, forceAngleRange, allowFootStand, allowFootHook
+    // 根据 type 设置 forceDirection 和 forceAngleRange
     private applyTypeDefaults() {
         switch (this.type) {
             case HoldType.JUG:
-                this.allowFootStand = true;
-                this.allowFootHook = true;
                 break;
             case HoldType.POCKET:
-                this.allowFootStand = true;
-                this.allowFootHook = false;
                 break;
             case HoldType.CRIMP:
-                this.allowFootStand = true;
-                this.allowFootHook = false;
                 break;
             case HoldType.VOLUME:
-                this.allowFootStand = true;
-                this.allowFootHook = true;
                 break;
             case HoldType.FOOTHOLD:
-                this.allowFootStand = true;
-                this.allowFootHook = false;
-                this.forceAngleDown = 0;
-                this.forceAngleUp = 0;
+                this.forceAngleRange = 0;  // 脚点无角度限制
                 break;
         }
     }
@@ -369,12 +347,13 @@ export class HoldBase extends Component {
     }
 
     public isForceInRange(worldPullDir: Vec2): boolean {
-        // 无角度限制（forceAngleDown 和 forceAngleUp 均为 0）：始终合法
-        if (this.forceAngleDown <= 0 && this.forceAngleUp <= 0) return true;
+        // 无角度限制（forceAngleRange 为 0）：始终合法
+        if (this.forceAngleRange <= 0) return true;
         const centerDir = this.getWorldForceDirection(); // 默认向下
         const cross = centerDir.x * worldPullDir.y - centerDir.y * worldPullDir.x;
         const dot = centerDir.x * worldPullDir.x + centerDir.y * worldPullDir.y;
         let angle = Math.atan2(cross, dot) * 180 / Math.PI;
-        return angle >= -this.forceAngleUp && angle <= this.forceAngleDown;
+        const halfRange = this.forceAngleRange / 2;
+        return angle >= -halfRange && angle <= halfRange;
     }
 }

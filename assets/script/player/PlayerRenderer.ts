@@ -128,6 +128,8 @@ export class PlayerRenderer {
         isPartUnderForce: (part: BodyPart) => boolean,
         getCenterOfMass: () => Vec2,
         getSupportXRange: () => { min: number; max: number } | null,
+        getForceVector: (part: BodyPart) => Vec2 | null,
+        lastAllocation: Map<BodyPart, number>,
         holdManager: HoldManager | null,
         gameLayer: any,
     ) {
@@ -221,6 +223,80 @@ export class PlayerRenderer {
         gfx.fillColor = new Color(255, 255, 0, 255);
         gfx.circle(com.x, com.y, 8 * s); gfx.fill();
 
+        // 可视化：绘制手/脚产生的力向量（箭头）并计算总力矩
+        let totalTorque = 0;
+        const drawArrow = (start: Vec2, vec: Vec2, color: Color, opts?: {thick?: boolean}) => {
+            // 缩放显示用，避免太长；放大以便调试更清晰
+            const scale = 0.12;
+            const endX = start.x + vec.x * scale;
+            const endY = start.y + vec.y * scale;
+            gfx.strokeColor = color;
+            gfx.lineWidth = (opts && opts.thick) ? 5 * s : 3 * s;
+            gfx.moveTo(start.x, start.y);
+            gfx.lineTo(endX, endY);
+            gfx.stroke();
+            // 箭头头部（三角形，填充更醒目）
+            const dirX = endX - start.x;
+            const dirY = endY - start.y;
+            const len = Math.sqrt(dirX * dirX + dirY * dirY) || 1;
+            const ux = dirX / len, uy = dirY / len;
+            const headLen = 16 * s;
+            const headWidth = 10 * s;
+            const leftX = endX - ux * headLen + -uy * headWidth;
+            const leftY = endY - uy * headLen + ux * headWidth;
+            const rightX = endX - ux * headLen + uy * headWidth;
+            const rightY = endY - uy * headLen + -ux * headWidth;
+            gfx.fillColor = new Color(color.r, color.g, color.b, 220);
+            gfx.moveTo(endX, endY);
+            gfx.lineTo(leftX, leftY);
+            gfx.lineTo(rightX, rightY);
+            gfx.close();
+            gfx.fill();
+            // 端点圆点提高可见性
+            gfx.fillColor = new Color(color.r, color.g, color.b, 255);
+            gfx.circle(endX, endY, 6 * s); gfx.fill();
+        };
+
+        for (const part of ['leftHand', 'rightHand', 'leftFoot', 'rightFoot'] as BodyPart[]) {
+            const force = getForceVector(part);
+            if (!force) continue;
+            const chain = part === 'leftHand' ? leftArm : part === 'rightHand' ? rightArm : part === 'leftFoot' ? leftLeg : rightLeg;
+            const pos = chain.target;
+            // 绘制箭头（手臂为绿色，脚为蓝色）
+            drawArrow(pos, force, part === 'leftHand' || part === 'rightHand' ? new Color(0,200,0,255) : new Color(0,120,255,255));
+            // 计算力矩（r x F）
+            const rx = pos.x - com.x;
+            const ry = pos.y - com.y;
+            totalTorque += rx * force.y - ry * force.x;
+        }
+
+        // 绘制总力矩条（在质心右侧）
+        const torqueScale = 0.06; // 可视缩放
+        const barLen = Math.max(-80, Math.min(80, totalTorque * torqueScale));
+        const barX = com.x + 30 * s;
+        const barY = com.y + 40 * s;
+        const barColor = Math.abs(barLen) < 8 ? new Color(0,200,0,200) : new Color(255,60,60,200);
+        gfx.fillColor = barColor;
+        gfx.rect(barX, barY, barLen, 8 * s);
+        gfx.fill();
+        // 如果提供了分配信息（lastAllocation），绘制被分配的额外箭头（黄色）
+        if (lastAllocation) {
+            for (const part of ['leftHand','rightHand','leftFoot','rightFoot'] as BodyPart[]) {
+                const alloc = lastAllocation.get(part) || 0;
+                if (alloc <= 0) continue;
+                const chain = part === 'leftHand' ? leftArm : part === 'rightHand' ? rightArm : part === 'leftFoot' ? leftLeg : rightLeg;
+                const f = getForceVector(part);
+                if (!f) continue;
+                const dir = f.clone(); dir.normalize();
+                const allocVec = new Vec2(dir.x * alloc, dir.y * alloc);
+                drawArrow(chain.target, allocVec, new Color(255,200,0,255), {thick: true});
+            }
+        }
+        // 中心线
+        gfx.strokeColor = new Color(0,0,0,120);
+        gfx.lineWidth = 1 * s;
+        gfx.moveTo(barX, barY); gfx.lineTo(barX + 1, barY + 8 * s); gfx.stroke();
+
         // 失衡警告：质心处红色闪烁
         if (imbalanceTimer > 0) {
             const warnAlpha = Math.abs(Math.sin(Date.now() * 0.01)) * 200 + 55;
@@ -274,11 +350,12 @@ export class PlayerRenderer {
             const allHolds = holdManager.getHolds();
             for (const hold of allHolds) {
                 if (hold.type === HoldType.VOLUME) continue;
-                if (hold.forceAngleDown <= 0 && hold.forceAngleUp <= 0) continue;
+                if (hold.forceAngleRange <= 0) continue;
                 const centerDir = hold.getWorldForceDirection();
                 const center = hold.localPos;
                 const radius = hold.adsorbRadius * s * 1.5;
-                PlayerRenderer.drawForceSector(gfx, center, radius, centerDir, hold.forceAngleDown, hold.forceAngleUp, hold.forceSectorColor);
+                const halfRange = hold.forceAngleRange / 2;
+                PlayerRenderer.drawForceSector(gfx, center, radius, centerDir, halfRange, halfRange, hold.forceSectorColor);
             }
             // 额外：为 Volume 岩点绘制线段
             for (const hold of allHolds) {

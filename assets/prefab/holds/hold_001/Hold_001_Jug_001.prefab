@@ -153,10 +153,7 @@
     "magnetRadius": 60,
     "cooldownTime": 2,
     "volumeMargin": 10,
-    "forceAngleDown": 60,
-    "forceAngleUp": 60,
-    "allowFootStand": true,
-    "allowFootHook": true,
+    "forceAngleRange": 150,
     "forceSectorColor": {
       "__type__": "cc.Color",
       "r": 255,

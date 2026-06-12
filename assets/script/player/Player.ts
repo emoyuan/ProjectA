@@ -72,6 +72,21 @@ export class Player extends Component {
     @property({ tooltip: '质心超出支撑多边形最大容忍时间（秒）' })
     balanceToleranceTime: number = 0.5;
 
+    @property({ tooltip: '力矩容忍度（允许的总力矩，单位为相对值）' })
+    torqueTolerance: number = 50;
+
+    @property({ tooltip: '手臂拉力大小（相对单位，用于力矩判定）' })
+    handPullForce: number = 100;
+
+    @property({ tooltip: '脚反作用力大小（相对单位，用于力矩判定）' })
+    footReactionForce: number = 100;
+
+    @property({ tooltip: '当双脚站地时，按比例放大力矩容忍度（用于更稳定的站立判定）' })
+    groundStabilityMultiplier: number = 2;
+
+    @property({ tooltip: '水平力容忍度（相对单位），用于侧向拉力判定' })
+    horizontalForceTolerance: number = 60;
+
     @property({ tooltip: '未吸附脚距离地平线多远以内视为站在地面上（像素）' })
     groundStandTolerance: number = 10;
 
@@ -463,13 +478,10 @@ export class Player extends Component {
 
         // 处理左脚
         if (this.adsorbedHold.has('leftFoot')) {
-            const hold = this.adsorbedHold.get('leftFoot')!;
-            if (hold.allowFootStand) {
-                const x = this.leftLeg.target.x;
-                minX = Math.min(minX, x - this.footWidth / 2);
-                maxX = Math.max(maxX, x + this.footWidth / 2);
-                hasSupport = true;
-            }
+            const x = this.leftLeg.target.x;
+            minX = Math.min(minX, x - this.footWidth / 2);
+            maxX = Math.max(maxX, x + this.footWidth / 2);
+            hasSupport = true;
         } else {
             if (Math.abs(this.leftLeg.target.y - this.groundY) < this.groundStandTolerance) {
                 const x = this.leftLeg.target.x;
@@ -481,13 +493,10 @@ export class Player extends Component {
 
         // 处理右脚
         if (this.adsorbedHold.has('rightFoot')) {
-            const hold = this.adsorbedHold.get('rightFoot')!;
-            if (hold.allowFootStand) {
-                const x = this.rightLeg.target.x;
-                minX = Math.min(minX, x - this.footWidth / 2);
-                maxX = Math.max(maxX, x + this.footWidth / 2);
-                hasSupport = true;
-            }
+            const x = this.rightLeg.target.x;
+            minX = Math.min(minX, x - this.footWidth / 2);
+            maxX = Math.max(maxX, x + this.footWidth / 2);
+            hasSupport = true;
         } else {
             if (Math.abs(this.rightLeg.target.y - this.groundY) < this.groundStandTolerance) {
                 const x = this.rightLeg.target.x;
@@ -998,7 +1007,7 @@ export class Player extends Component {
 
         // 脚部不参与角度判定
         if (part === 'leftFoot' || part === 'rightFoot') {
-            return hold.allowFootStand || hold.allowFootHook;
+            return true;  // 脚默认总是能提供支撑
         }
 
         // 拉力方向：小臂方向（肘 → 手），即 mid - end
@@ -1212,15 +1221,541 @@ export class Player extends Component {
         this.resetToInitialPose();
     }
 
-    private checkBalance(dt: number) {
-        if (!this.isComOverSupport()) {
-            this.imbalanceTimer += dt * 1000;
-            if (this.imbalanceTimer >= this.balanceToleranceTime * 1000) {
-                this.onFall();
-            }
-        } else {
-            this.imbalanceTimer = 0;
+    /**
+     * 计算并判断力矩平衡，以及与几何支撑一起决定是否失衡
+     * 思路：在保留质心投影检查的同时，新增绕质心的总力矩判定
+     */
+    private getHandPullForce(part: BodyPart): Vec2 | null {
+        if (part !== 'leftHand' && part !== 'rightHand') return null;
+        if (!this.adsorbedHold.has(part)) return null;
+        const chain = this.getChainByPart(part);
+        if (!chain) return null;
+
+        // 拉力方向：小臂方向（肘 -> 手） = mid - end
+        const dir = new Vec2(chain.mid.x - chain.end.x, chain.mid.y - chain.end.y);
+        const len = dir.length();
+        if (len < 1e-4) return null;
+        dir.normalize();
+
+        // 根据手臂伸展程度调整拉力强度：接近臂长时产生更多拉力，靠近身体时较小
+        const maxLen = chain.upperLen + chain.lowerLen;
+        const stretch = Vec2.distance(chain.root, chain.end) / Math.max(1, maxLen); // 0..1
+        // 低于 0.5 时拉力较小，接近 1 时接近满力
+        const pullIntensity = Math.max(0, Math.min(1, (stretch - 0.5) / 0.5));
+
+        // 考虑手臂拉方向与岩点基准受力方向的夹角：夹角越大（更横），适当略增拉力量级以反映更强的侧向分力
+        const hold = this.adsorbedHold.get(part)!;
+        let angleFactor = 1;
+        if (hold && typeof hold.getWorldForceDirection === 'function') {
+            const centerDir = hold.getWorldForceDirection();
+            const dot = Math.max(-1, Math.min(1, dir.x * centerDir.x + dir.y * centerDir.y));
+            const ang = Math.acos(dot); // 0..PI
+            // 将角度映射为一个温和增益，最大约 +20%（当角度接近 PI）
+            angleFactor = 1 + 0.2 * (Math.abs(ang) / Math.PI);
         }
+
+        // 最终拉力大小：保底比例 + 强度 * 角度增益（整体更保守，避免手臂总是产生过大力矩）
+        const mag = this.handPullForce * (0.2 + 0.6 * pullIntensity) * angleFactor;
+        return new Vec2(dir.x * mag, dir.y * mag);
+    }
+
+    private getFootReactionForce(part: BodyPart): Vec2 | null {
+        if (part !== 'leftFoot' && part !== 'rightFoot') return null;
+        const chain = this.getChainByPart(part);
+        if (!chain) return null;
+
+        // 脚被岩点吸附：反作用力沿髋->脚方向的反向（推向身体）
+        if (this.adsorbedHold.has(part)) {
+            // root 为髋部连接点，end 为脚
+            const dir = new Vec2(chain.root.x - chain.end.x, chain.root.y - chain.end.y);
+            const len = dir.length();
+            if (len < 1e-4) return null;
+            dir.normalize();
+            return new Vec2(dir.x * this.footReactionForce, dir.y * this.footReactionForce);
+        }
+
+        // 脚站在地面上（未吸附），反作用力竖直向上
+        if (this.isFootOnGround(part)) {
+            return new Vec2(0, this.footReactionForce);
+        }
+
+        return null;
+    }
+
+    private calculateTotalTorque(com: Vec2): number {
+        let total = 0;
+
+        // hands
+        for (const part of ['leftHand', 'rightHand'] as BodyPart[]) {
+            const force = this.getHandPullForce(part);
+            if (!force) continue;
+            const pos = this.getChainByPart(part)!.target;
+            const rx = pos.x - com.x;
+            const ry = pos.y - com.y;
+            total += rx * force.y - ry * force.x;
+        }
+
+        // feet
+        for (const part of ['leftFoot', 'rightFoot'] as BodyPart[]) {
+            const force = this.getFootReactionForce(part);
+            if (!force) continue;
+            const pos = this.getChainByPart(part)!.target;
+            const rx = pos.x - com.x;
+            const ry = pos.y - com.y;
+            total += rx * force.y - ry * force.x;
+        }
+
+        return total;
+    }
+
+    /** 计算所有接触点作用在身体上的总力向量 */
+    private calculateTotalForce(): Vec2 {
+        const total = new Vec2(0, 0);
+
+        for (const part of ['leftHand', 'rightHand'] as BodyPart[]) {
+            const f = this.getHandPullForce(part);
+            if (!f) continue;
+            total.x += f.x; total.y += f.y;
+        }
+        for (const part of ['leftFoot', 'rightFoot'] as BodyPart[]) {
+            const f = this.getFootReactionForce(part);
+            if (!f) continue;
+            total.x += f.x; total.y += f.y;
+        }
+        return total;
+    }
+
+    /**
+     * 计算平衡判定所需的容忍度参数
+     */
+    private computeBalanceTolerances(range: {min:number,max:number}|null): {
+        effectiveTorqueTolerance: number;
+        effectiveHorizontalTolerance: number;
+    } {
+        let supportWidth = 0;
+        if (range) supportWidth = Math.max(1, range.max - range.min);
+        
+        // 根据支撑宽度缩放力矩容忍度
+        let widthScale = Math.max(1, supportWidth / Math.max(1, this.footWidth * 1.5));
+        
+        // 双脚都在地面或吸附时进一步放大
+        const leftOnGround = this.isFootOnGround('leftFoot') || this.adsorbedHold.has('leftFoot');
+        const rightOnGround = this.isFootOnGround('rightFoot') || this.adsorbedHold.has('rightFoot');
+        if (leftOnGround && rightOnGround) {
+            widthScale *= this.groundStabilityMultiplier;
+        }
+        const effectiveTorqueTolerance = this.torqueTolerance * widthScale;
+        
+        // 水平力容忍度
+        const forceWidthScale = Math.max(1, supportWidth / Math.max(1, this.footWidth));
+        let supportCount = 0;
+        for (const p of ['leftFoot','rightFoot','leftHand','rightHand'] as BodyPart[]) {
+            if (this.adsorbedHold.has(p) || ((p === 'leftFoot' || p === 'rightFoot') && this.isFootOnGround(p))) supportCount++;
+        }
+        const effectiveHorizontalTolerance = this.horizontalForceTolerance * forceWidthScale * (1 + supportCount * 0.25);
+        
+        return { effectiveTorqueTolerance, effectiveHorizontalTolerance };
+    }
+
+    // 上次可行性分配（用于可视化）：肢体 -> 已分配的力大小（标量，沿肢体方向）
+    private lastAllocation: Map<BodyPart, number> = new Map();
+
+    /**
+     * 判断是否存在一组肢体出力分配，使得力矩与水平修正要求被满足。
+     * 使用贪心两阶段算法：先尝试满足力矩再满足水平力；若失败则交换顺序再试。
+     */
+    private canProvideCorrectiveForces(com: Vec2, range: {min:number,max:number}|null): { feasible: boolean, alloc?: Map<BodyPart,number> } {
+        this.lastAllocation.clear();
+
+        // 计算需求：力矩需求与水平力需求（带符号）
+        const totalTorque = this.calculateTotalTorque(com);
+        const totalForce = this.calculateTotalForce();
+
+        // 支撑中心与归一化距离
+        let center = 0; let half = 1;
+        if (range) { center = (range.min + range.max) / 2; half = Math.max(1e-3, (range.max - range.min) / 2); }
+        const dist = Math.abs(com.x - center);
+        const normCOM = dist / half;
+
+        // 计算容忍度（使用辅助方法避免重复）
+        const {effectiveTorqueTolerance, effectiveHorizontalTolerance} = this.computeBalanceTolerances(range);
+
+        // torque need = amount by which |totalTorque| exceeds tolerance
+        const deltaTorqueNeeded = Math.max(0, Math.abs(totalTorque) - effectiveTorqueTolerance);
+        const T_req_signed = deltaTorqueNeeded > 0 ? -Math.sign(totalTorque) * deltaTorqueNeeded : 0;
+
+        // horizontal need: 考虑两个方面
+        // 1) COM超出支撑区时的恢复需求
+        // 2) 总水平力不平衡时的修正需求（用于侧拉等倾斜姿态）
+        let H_req_signed = 0;
+        if (normCOM > 1) {
+            // COM超出支撑区，需要拉回
+            H_req_signed = -Math.sign(com.x - center) * ((normCOM - 1) * effectiveHorizontalTolerance);
+        } else {
+            // COM在支撑区内，但检查总水平力是否平衡（侧拉、倾斜等情况）
+            const totalHorizForce = totalForce.x;
+            const excessHoriz = Math.abs(totalHorizForce) - effectiveHorizontalTolerance;
+            if (excessHoriz > 0) {
+                // 总水平力超过容忍度，需要修正
+                H_req_signed = -Math.sign(totalHorizForce) * excessHoriz;
+            }
+        }
+
+        // build actuator list
+        type Act = { part: BodyPart, pos: Vec2, dir: Vec2, maxF: number, torquePerUnit: number, horizPerUnit: number };
+        const acts: Act[] = [];
+        for (const part of ['leftHand','rightHand','leftFoot','rightFoot'] as BodyPart[]) {
+            const chain = this.getChainByPart(part);
+            if (!chain) continue;
+            // direction unit
+            let dir: Vec2 | null = null;
+            if (part === 'leftHand' || part === 'rightHand') {
+                const d = new Vec2(chain.mid.x - chain.end.x, chain.mid.y - chain.end.y);
+                if (d.length() < 1e-4) continue;
+                d.normalize(); dir = d;
+            } else {
+                if (this.adsorbedHold.has(part)) {
+                    const d = new Vec2(chain.root.x - chain.end.x, chain.root.y - chain.end.y);
+                    if (d.length() < 1e-4) continue; d.normalize(); dir = d;
+                } else if (this.isFootOnGround(part)) {
+                    dir = new Vec2(0, 1); // ground reaction upward
+                } else continue;
+            }
+            const pos = chain.target;
+            // maxF: conservative capacity
+            const maxF = (part === 'leftHand' || part === 'rightHand') ? this.handPullForce : this.footReactionForce;
+            const torquePerUnit = (pos.x - com.x) * dir.y - (pos.y - com.y) * dir.x;
+            const horizPerUnit = dir.x;
+            acts.push({ part, pos, dir, maxF, torquePerUnit, horizPerUnit });
+        }
+
+        const tryAllocation = (first: 'torque'|'horiz') => {
+            // remaining needs
+            let remT = T_req_signed;
+            let remH = H_req_signed;
+            const alloc = new Map<BodyPart, number>();
+            // available capacities
+            const avail = new Map<BodyPart, number>();
+            for (const a of acts) avail.set(a.part, a.maxF);
+
+            const allocateForTorque = () => {
+                if (remT === 0) return true;
+                // select actuators that contribute torque in needed sign
+                const neededSign = Math.sign(remT);
+                // compute contributions per unit force
+                const candidates = acts.filter(a => Math.sign(a.torquePerUnit) === neededSign && Math.abs(a.torquePerUnit) > 1e-6);
+                // sort by efficiency (torque per force) descending
+                candidates.sort((a,b)=> Math.abs(b.torquePerUnit) - Math.abs(a.torquePerUnit));
+                for (const c of candidates) {
+                    const cap = avail.get(c.part) || 0;
+                    if (cap <= 0) continue;
+                    const per = c.torquePerUnit; // per unit force
+                    const need = Math.abs(remT);
+                    const reqForce = need / Math.abs(per);
+                    const use = Math.min(cap, reqForce);
+                    const prev = alloc.get(c.part) || 0;
+                    alloc.set(c.part, prev + use);
+                    avail.set(c.part, cap - use);
+                    // reduce remT by sign(per)*use*per
+                    remT -= Math.sign(per) * use * per;
+                    if (Math.abs(remT) < 1e-3) { remT = 0; break; }
+                }
+                return Math.abs(remT) < 1e-3;
+            };
+
+            const allocateForHoriz = () => {
+                if (remH === 0) return true;
+                const neededSign = Math.sign(remH);
+                const candidates = acts.filter(a => Math.sign(a.horizPerUnit) === neededSign && Math.abs(a.horizPerUnit) > 1e-6);
+                // sort by horizontal efficiency
+                candidates.sort((a,b)=> Math.abs(b.horizPerUnit) - Math.abs(a.horizPerUnit));
+                for (const c of candidates) {
+                    const cap = avail.get(c.part) || 0;
+                    if (cap <= 0) continue;
+                    const per = c.horizPerUnit;
+                    const need = Math.abs(remH);
+                    const reqForce = need / Math.abs(per);
+                    const use = Math.min(cap, reqForce);
+                    const prev = alloc.get(c.part) || 0;
+                    alloc.set(c.part, prev + use);
+                    avail.set(c.part, cap - use);
+                    remH -= Math.sign(per) * use * per;
+                    if (Math.abs(remH) < 1e-3) { remH = 0; break; }
+                }
+                return Math.abs(remH) < 1e-3;
+            };
+
+            if (first === 'torque') {
+                const okT = allocateForTorque();
+                const okH = allocateForHoriz();
+                if (okT && okH) return {ok:true, alloc};
+            } else {
+                const okH = allocateForHoriz();
+                const okT = allocateForTorque();
+                if (okH && okT) return {ok:true, alloc};
+            }
+            return {ok:false, alloc: new Map<BodyPart,number>()};
+        };
+
+        const r1 = tryAllocation('torque');
+        if (r1.ok) return {feasible:true, alloc: r1.alloc};
+        const r2 = tryAllocation('horiz');
+        if (r2.ok) return {feasible:true, alloc: r2.alloc};
+        return {feasible:false};
+    }
+
+    private isTorqueBalanced(com: Vec2): boolean {
+        const total = this.calculateTotalTorque(com);
+        return Math.abs(total) <= this.torqueTolerance;
+    }
+
+    private checkBalance(dt: number) {
+        const com = this.getCenterOfMass();
+        const range = this.getSupportXRange();
+        const {effectiveTorqueTolerance, effectiveHorizontalTolerance} = this.computeBalanceTolerances(range);
+
+        // 计算当前不平衡的缺口
+        const totalTorque = this.calculateTotalTorque(com);
+        const totalForce = this.calculateTotalForce();
+        
+        // 支撑中心
+        let center = 0;
+        if (range) center = (range.min + range.max) / 2;
+
+        // 判断是否可行：能否通过调整肢体出力来达到平衡
+        const feasible = this.canAchieveBalance(com, range, effectiveTorqueTolerance, effectiveHorizontalTolerance);
+        
+        if (feasible) {
+            this.imbalanceTimer = 0;
+            this.lastAllocation.clear();
+        } else {
+            this.lastAllocation.clear();
+            this.imbalanceTimer += dt * 1000;
+            if (this.imbalanceTimer >= this.balanceToleranceTime * 1000) this.onFall();
+        }
+    }
+
+    /**
+     * 判断是否可以通过调整肢体出力来达到平衡
+     * 核心约束：
+     * 1) 力矩平衡（绕质心）
+     * 2) 水平力平衡
+     * 3) 质心X投影必须在支撑范围内
+     */
+    private canAchieveBalance(com: Vec2, range: {min:number,max:number}|null, torqueTol: number, horizTol: number): boolean {
+        // 约束3：质心投影约束
+        // 质心必须在所有接触点形成的支撑区间内
+        if (range) {
+            if (com.x < range.min || com.x > range.max) {
+                // 质心已经超出支撑区，无法通过调整权重来修复（权重只改变力的大小，不改变方向和位置）
+                return false;
+            }
+        }
+
+        // 构建所有可用肢体的信息（当前最大出力）
+        type Limb = {
+            part: BodyPart;
+            force: Vec2;  // 当前最大出力向量
+            magnitude: number;  // 出力大小
+            position: Vec2;  // 接触点位置
+        };
+        const limbs: Limb[] = [];
+
+        for (const part of ['leftHand', 'rightHand', 'leftFoot', 'rightFoot'] as BodyPart[]) {
+            let force: Vec2 | null = null;
+            if (part === 'leftHand' || part === 'rightHand') {
+                force = this.getHandPullForce(part);
+            } else {
+                force = this.getFootReactionForce(part);
+            }
+            if (!force) continue;
+
+            const chain = this.getChainByPart(part);
+            if (!chain) continue;
+
+            const mag = Math.sqrt(force.x * force.x + force.y * force.y);
+            if (mag < 1e-4) continue;  // 忽略非常小的力
+
+            limbs.push({
+                part,
+                force,
+                magnitude: mag,
+                position: chain.target,
+            });
+        }
+
+        if (limbs.length === 0) return false;
+
+        // 现在问题是：能否分配权重 w ∈ [0,1] 给每个肢体，使得力矩和水平力平衡？
+        // 简化方案：用贪心搜索两种策略，看哪一种能成功
+        
+        return this.tryBalanceWithWeights(limbs, com, torqueTol, horizTol);
+    }
+
+    /**
+     * 用权重分配尝试平衡：每个肢体的实际出力 = weight * maxForce
+     */
+    private tryBalanceWithWeights(
+        limbs: {part: BodyPart, force: Vec2, magnitude: number, position: Vec2}[],
+        com: Vec2,
+        torqueTol: number,
+        horizTol: number
+    ): boolean {
+        // 尝试几种不同的权重分配策略
+        
+        // 策略1：所有肢体都满出（w=1）
+        // 这是最强的出力配置，如果连这都无法平衡，那就真的无法平衡
+        let totalTorque = 0, totalHoriz = 0;
+        for (const limb of limbs) {
+            const rx = limb.position.x - com.x;
+            const ry = limb.position.y - com.y;
+            totalTorque += rx * limb.force.y - ry * limb.force.x;
+            totalHoriz += limb.force.x;
+        }
+        if (Math.abs(totalTorque) <= torqueTol && Math.abs(totalHoriz) <= horizTol) {
+            return true;
+        }
+
+        // 策略2：贪心调整 - 优先平衡力矩，再平衡水平力
+        const weights1 = this.greedyBalance(limbs, com, torqueTol, horizTol, ['torque', 'horiz']);
+        if (weights1) return true;
+
+        // 策略3：贪心调整 - 优先平衡水平力，再平衡力矩
+        const weights2 = this.greedyBalance(limbs, com, torqueTol, horizTol, ['horiz', 'torque']);
+        if (weights2) return true;
+
+        // 如果贪心都找不到方案，则不可行
+        // （移除了系统搜索，因为盲目尝试所有组合容易找到虚假平衡）
+        return false;
+    }
+
+    /**
+     * 贪心平衡：按给定顺序调整权重以满足约束
+     */
+    private greedyBalance(
+        limbs: {part: BodyPart, force: Vec2, magnitude: number, position: Vec2}[],
+        com: Vec2,
+        torqueTol: number,
+        horizTol: number,
+        order: ('torque' | 'horiz')[]
+    ): boolean {
+        const weights = new Map(limbs.map(l => [l.part, 0]));  // 初始都不出力
+
+        for (const phase of order) {
+            if (phase === 'torque') {
+                // 计算当前的不平衡力矩
+                let currentTorque = 0;
+                for (const limb of limbs) {
+                    const w = weights.get(limb.part) || 0;
+                    const f = new Vec2(limb.force.x * w, limb.force.y * w);
+                    const rx = limb.position.x - com.x;
+                    const ry = limb.position.y - com.y;
+                    currentTorque += rx * f.y - ry * f.x;
+                }
+
+                // 如果力矩超出容忍度，尝试调整肢体权重
+                if (Math.abs(currentTorque) > torqueTol) {
+                    const neededSign = Math.sign(currentTorque);
+                    // 找能产生反向力矩的肢体
+                    const candidates = limbs.map(limb => {
+                        const rx = limb.position.x - com.x;
+                        const ry = limb.position.y - com.y;
+                        const torquePerUnit = rx * limb.force.y / limb.magnitude - ry * limb.force.x / limb.magnitude;
+                        return { limb, torquePerUnit };
+                    }).filter(c => Math.sign(c.torquePerUnit) === neededSign && Math.abs(c.torquePerUnit) > 1e-6)
+                     .sort((a, b) => Math.abs(b.torquePerUnit) - Math.abs(a.torquePerUnit));
+
+                    for (const {limb, torquePerUnit} of candidates) {
+                        const needReduction = Math.abs(currentTorque);
+                        const needWeight = needReduction / Math.abs(torquePerUnit);
+                        const assignWeight = Math.min(1, Math.max(0, needWeight));
+                        weights.set(limb.part, assignWeight);
+                        currentTorque -= Math.sign(torquePerUnit) * assignWeight * torquePerUnit;
+                        if (Math.abs(currentTorque) <= torqueTol) break;
+                    }
+                }
+            } else {
+                // 计算当前的不平衡水平力
+                let currentHoriz = 0;
+                for (const limb of limbs) {
+                    const w = weights.get(limb.part) || 0;
+                    currentHoriz += limb.force.x * w;
+                }
+
+                // 如果水平力超出容忍度，尝试调整权重
+                if (Math.abs(currentHoriz) > horizTol) {
+                    const neededSign = Math.sign(currentHoriz);
+                    const candidates = limbs.filter(limb => Math.sign(limb.force.x) === neededSign && Math.abs(limb.force.x) > 1e-6)
+                        .sort((a, b) => Math.abs(b.force.x) - Math.abs(a.force.x));
+
+                    for (const limb of candidates) {
+                        const needReduction = Math.abs(currentHoriz);
+                        const needWeight = needReduction / Math.abs(limb.force.x);
+                        const assignWeight = Math.min(1, Math.max(0, needWeight));
+                        weights.set(limb.part, Math.max(weights.get(limb.part) || 0, assignWeight));
+                        currentHoriz -= Math.sign(limb.force.x) * assignWeight * limb.force.x;
+                        if (Math.abs(currentHoriz) <= horizTol) break;
+                    }
+                }
+            }
+        }
+
+        // 检查最终是否平衡
+        let finalTorque = 0, finalHoriz = 0;
+        for (const limb of limbs) {
+            const w = weights.get(limb.part) || 0;
+            const f = new Vec2(limb.force.x * w, limb.force.y * w);
+            const rx = limb.position.x - com.x;
+            const ry = limb.position.y - com.y;
+            finalTorque += rx * f.y - ry * f.x;
+            finalHoriz += f.x;
+        }
+        return Math.abs(finalTorque) <= torqueTol && Math.abs(finalHoriz) <= horizTol;
+    }
+
+    /**
+     * 系统性搜索：对每个肢体尝试几个代表性权重（0, 0.5, 1）的组合
+     */
+    private trySystematicSearch(
+        limbs: {part: BodyPart, force: Vec2, magnitude: number, position: Vec2}[],
+        com: Vec2,
+        torqueTol: number,
+        horizTol: number
+    ): boolean {
+        // 只在肢体较少的情况下尝试（否则组合爆炸）
+        if (limbs.length > 4) return false;
+
+        const weights = new Array(limbs.length).fill(0);
+        const tryWeights = (index: number): boolean => {
+            if (index === limbs.length) {
+                // 检查这个权重组合是否平衡
+                
+                // 关键：排除所有肢体都不出力的情况（那样身体会掉下来，虚假平衡）
+                const anyActive = weights.some(w => w > 1e-6);
+                if (!anyActive) return false;
+                
+                let torque = 0, horiz = 0;
+                for (let i = 0; i < limbs.length; i++) {
+                    const limb = limbs[i];
+                    const w = weights[i];
+                    const f = new Vec2(limb.force.x * w, limb.force.y * w);
+                    const rx = limb.position.x - com.x;
+                    const ry = limb.position.y - com.y;
+                    torque += rx * f.y - ry * f.x;
+                    horiz += f.x;
+                }
+                return Math.abs(torque) <= torqueTol && Math.abs(horiz) <= horizTol;
+            }
+
+            // 尝试几个权重值
+            for (const w of [0, 0.25, 0.5, 0.75, 1.0]) {
+                weights[index] = w;
+                if (tryWeights(index + 1)) return true;
+            }
+            return false;
+        };
+
+        return tryWeights(0);
     }
 
     private clampHipToAdsorbedArms(hipX: number, hipY: number): Vec2 {
@@ -1443,8 +1978,7 @@ export class Player extends Component {
             if (p === 'leftHand' || p === 'rightHand') {
                 if (!this.isPartUnderForce(p)) return;
             } else {
-                // 脚：至少需要允许站立/钩挂其中一种
-                if (!hold.allowFootStand && !hold.allowFootHook) return;
+                // 脚：无需检查，脚默认可以站立
             }
         }
 
@@ -1540,6 +2074,13 @@ export class Player extends Component {
         const gfx = this.node.getComponent(Graphics);
         if (!gfx) return;
 
+        // 将力向量查询函数传给渲染器以便可视化调试
+        const getForceVector = (part: BodyPart): Vec2 | null => {
+            const hand = this.getHandPullForce(part);
+            if (hand) return hand;
+            return this.getFootReactionForce(part);
+        };
+
         PlayerRenderer.drawCharacter(
             gfx,
             this.scaleFactor,
@@ -1568,9 +2109,20 @@ export class Player extends Component {
             this.isPartUnderForce.bind(this),
             this.getCenterOfMass.bind(this),
             this.getSupportXRange.bind(this),
+            getForceVector,
+            this.lastAllocation,
             this.holdManager,
             this.gameLayer,
         );
+    }
+
+    /**
+     * 对外公开：获取肢体的判定用力向量（仅用于可视化/调试）
+     */
+    public getForceVector(part: BodyPart): Vec2 | null {
+        const h = this.getHandPullForce(part);
+        if (h) return h;
+        return this.getFootReactionForce(part);
     }
 
 }
